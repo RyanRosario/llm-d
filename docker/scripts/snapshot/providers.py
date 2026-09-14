@@ -65,8 +65,9 @@ class GKESnapshotProvider:
             return
 
         # Log a warning instead of raising an error if eager loading is not detected in sys.argv.
-        # Clearing cached weights without eager loading can break memory-mapped file descriptors,
-        # but we do not fail hard to avoid false positives for non-safetensors models.
+        # Under mmap the weights stay in file-backed pages; once this cache is cleared those pages
+        # are backed by paths that no longer exist, so the checkpoint cannot capture and restore
+        # them. We do not fail hard, to avoid false positives for non-safetensors models.
         if not _is_eager_loading_configured():
             logger.warning(
                 "Clearing model cache without '--safetensors-load-strategy eager' detected. "

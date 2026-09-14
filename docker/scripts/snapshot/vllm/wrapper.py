@@ -75,13 +75,15 @@ def patch_vllm_lifespan(app, snapshot_provider: Optional[GKESnapshotProvider] = 
 
             logger.info("Triggering snapshot checkpoint...")
             try:
+                # trigger() blocks until gVisor has checkpointed the sandbox and resumed it.
+                # Execution reaches the next line twice: once in the pod that took the
+                # checkpoint, and again in every pod later restored from that snapshot.
                 await asyncio.to_thread(snapshot_provider.trigger)
                 logger.info("Snapshot checkpoint created successfully.")
+                logger.info("Process restored from snapshot checkpoint. Resuming engine...")
             except Exception as e:
                 logger.error("Snapshot checkpointing failed: %s. Resuming vLLM service without checkpoint.", e, exc_info=True)
-
-            # --- PROCESS RESTORED ON WAKE-UP regardless if snapshot was successful ---
-            logger.info("Process restored from snapshot checkpoint. Resuming engine...")
+                logger.info("Resuming engine without a snapshot checkpoint...")
 
             # Re-allocate physical VRAM maps
             if engine and hasattr(engine, "wake_up"):
