@@ -1,12 +1,8 @@
 # The PodSnapshotStorageConfig uses tokenSource "podKSA", so the gVisor sandbox
-# authenticates to GCS as this KSA principal directly via Workload Identity
+# authenticates to GCS as the Pod's KSA directly via Workload Identity
 # Federation. No `iam.gke.io/gcp-service-account` annotation is needed -- the
-# bucket IAM binding targets the `principal://.../sa/<ksa>` subject instead.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: sa
----
+# bucket IAM binding targets the `principal://.../sa/<ksa>` subject instead, so
+# the ServiceAccount from recipes/modelserver/common/sa.yaml is used unmodified.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -46,8 +42,16 @@ spec:
             # only routes weights through CuMemAllocator when sleep mode is on at
             # engine construction. Without it, sleep succeeds but frees nothing.
             - "--enable-sleep-mode"
+            # 0.95, not the more common 0.90. Measured on an 80GB H100: weights
+            # take 61.03 GiB and activations/non-torch overhead ~2.1 GiB, so
+            # 0.90 (a 71.6 GiB budget) leaves only 8.51 GiB for KV cache while
+            # the model's 40960-token max_model_len needs 10.0 GiB. vLLM then
+            # raises ValueError, EngineCore dies, and the pod crash-loops with
+            # only a generic "Engine core initialization failed" at the API
+            # server -- the real error is in the EngineCore child's output.
+            # 0.95 yields a 75.6 GiB budget and ~12.5 GiB of KV cache.
             - "--gpu-memory-utilization"
-            - "0.90"
+            - "0.95"
             # Disables CUDA graph capture, matching the reference Pod. Note:
             # graphs were tested and are NOT the cause of checkpoint failures.
             # Costs decode latency, so re-evaluate once snapshots succeed.
