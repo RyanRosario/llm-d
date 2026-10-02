@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from typing import Optional
 
 from ..providers import (
@@ -25,7 +26,20 @@ from ..providers import (
 )
 
 
+WRAPPER_IMPORT_TIME = time.monotonic()
+
 logger = logging.getLogger("sglang.snapshot.wrapper")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(
+        logging.Formatter(
+            "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)d] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 def patch_sglang_wait_and_warmup(snapshot_provider: Optional[GKESnapshotProvider] = None):
@@ -70,6 +84,15 @@ def patch_sglang_wait_and_warmup(snapshot_provider: Optional[GKESnapshotProvider
         launch_callback=None,
         execute_warmup_func=_execute_server_warmup,
     ):
+        t_enter = time.monotonic()
+        logger.info(
+            "[Control Plane] Entering patched _wait_and_warmup (pid=%d, provider=%s, proc_path='%s', cache_dir=%r, elapsed_since_start=%.2fs).",
+            os.getpid(),
+            type(snapshot_provider).__name__,
+            getattr(snapshot_provider, "proc_path", "unknown"),
+            getattr(snapshot_provider, "cache_dir", None),
+            t_enter - WRAPPER_IMPORT_TIME,
+        )
         # This is a blocking function not asynchronous context.
         if hasattr(snapshot_provider, "is_available") and not snapshot_provider.is_available():
             logger.warning(
@@ -82,10 +105,15 @@ def patch_sglang_wait_and_warmup(snapshot_provider: Optional[GKESnapshotProvider
                 execute_warmup_func=execute_warmup_func,
             )
 
-        logging.info("Waiting for weights to download and be ready in GPUs.")
+        logger.info("[Control Plane] Checking if model weights are ready in GPUs...")
         if get_model().checkpoint_engine_wait_weights_before_ready:
+            t_weights = time.monotonic()
+            logger.info("[Control Plane] Waiting for checkpoint engine weights to be ready in GPUs...")
             _wait_weights_ready()
-            logging.info("Weights are ready in GPUs.")
+            logger.info(
+                "[Control Plane] Model weights are ready in GPUs (waited %.2fs).",
+                time.monotonic() - t_weights,
+            )
 
         # Joiner schedulers are served through the primary after adoption.
         skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
@@ -97,47 +125,99 @@ def patch_sglang_wait_and_warmup(snapshot_provider: Optional[GKESnapshotProvider
 
         # Warmup captures CUDA graphs and pre-allocates VRAM
         if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
+            t_warmup = time.monotonic()
+            logger.info("[Control Plane] Starting SGLang server warmup (capturing CUDA graphs & pre-allocating VRAM)...")
             if not execute_warmup_func(server_args):
+                logger.error("[Control Plane] Server warmup failed; aborting before snapshot checkpoint.")
                 return
+            logger.info(
+                "[Control Plane] Server warmup completed in %.2fs (cold-start elapsed_since_start=%.2fs).",
+                time.monotonic() - t_warmup,
+                time.monotonic() - WRAPPER_IMPORT_TIME,
+            )
         else:
             logger.warning("[Control Plane] Warmup skipped.")
 
+        t_gc = time.monotonic()
+        logger.info("[Control Plane] Freezing Python garbage collection after server warmup...")
         _freeze_gc_after_server_warmup(server_args)
+        logger.info(
+            "[Control Plane] Froze Python garbage collection in %.2fs.",
+            time.monotonic() - t_gc,
+        )
 
         tokenizer_manager = http_server._global_state.tokenizer_manager
         tokenizer_manager.server_status = ServerStatus.Starting
+        logger.info(
+            "[Control Plane] Set tokenizer_manager.server_status = %s (keeping /health at 503 during sleep/checkpoint).",
+            tokenizer_manager.server_status,
+        )
 
         # SLEEP
-        logger.info("[Control Plane] Sleep signal received. Releasing memory occupation...")
+        sleep_tags = ["weights", "kv_cache"]
+        t_sleep = time.monotonic()
+        logger.info(
+            "[Control Plane] Sleep signal received. Releasing GPU memory occupation for tags=%s...",
+            sleep_tags,
+        )
         asyncio.run_coroutine_threadsafe(
-            tokenizer_manager.release_memory_occupation(ReleaseMemoryOccupationReqInput(tags=["weights", "kv_cache"])),
+            tokenizer_manager.release_memory_occupation(ReleaseMemoryOccupationReqInput(tags=sleep_tags)),
             tokenizer_manager.event_loop,
         ).result()
+        logger.info(
+            "[Control Plane] Released GPU memory occupation for tags=%s in %.2fs.",
+            sleep_tags,
+            time.monotonic() - t_sleep,
+        )
 
-        logger.info("Triggering snapshot checkpoint...")
+        t_trigger = time.monotonic()
+        logger.info("[Control Plane] Triggering snapshot checkpoint via %s...", type(snapshot_provider).__name__)
         try:
             snapshot_provider.trigger()
-            logger.info("Snapshot checkpoint created successfully.")
+            logger.info(
+                "[Control Plane] Snapshot checkpoint created / process restored from checkpoint (barrier elapsed=%.2fs).",
+                time.monotonic() - t_trigger,
+            )
         except Exception as e:
             logger.error("Snapshot checkpointing failed: %s. Resuming sglang service without checkpoint.", e, exc_info=True)
 
         # WAKE
-        logger.info("[Control Plane] Wake signal received. Resuming memory occupation...")
+        wake_tags = ["weights", "kv_cache"]
+        t_wake = time.monotonic()
+        logger.info(
+            "[Control Plane] Wake signal received. Resuming GPU memory occupation for tags=%s...",
+            wake_tags,
+        )
         asyncio.run_coroutine_threadsafe(
             tokenizer_manager.resume_memory_occupation(
-                ResumeMemoryOccupationReqInput(tags=["weights", "kv_cache"])),
+                ResumeMemoryOccupationReqInput(tags=wake_tags)),
             tokenizer_manager.event_loop,
         ).result()
+        wake_elapsed = time.monotonic() - t_wake
+        logger.info(
+            "[Control Plane] Resumed GPU memory occupation for tags=%s in %.2fs.",
+            wake_tags,
+            wake_elapsed,
+        )
+
         # The server is ready for requests
-        # Only set the server to ready once it has woken up again. This satisfies the readiness prob
+        # Only set the server to ready once it has woken up again. This satisfies the readiness probe
         tokenizer_manager.server_status = ServerStatus.Up
-        logger.info("The server is fired up and ready to roll!")
+        logger.info(
+            "[Control Plane] Set tokenizer_manager.server_status = %s (wake-to-ready=%.2fs). The server is fired up and ready to roll!",
+            tokenizer_manager.server_status,
+            time.monotonic() - t_wake,
+        )
 
         if get_observability().debug_tensor_dump_input_file:
+            logger.info("[Control Plane] debug_tensor_dump_input_file set; terminating process tree (pid=%d).", os.getpid())
             kill_process_tree(os.getpid())
 
         if launch_callback is not None:
+            t_cb = time.monotonic()
+            logger.info("[Control Plane] Invoking launch_callback...")
             launch_callback()
+            logger.info("[Control Plane] launch_callback completed in %.2fs.", time.monotonic() - t_cb)
 
     http_server._wait_and_warmup = patched_wait_and_warmup
     logger.info("Successfully patched SGLang _wait_and_warmup for GKE snapshotting.")

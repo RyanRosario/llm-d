@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sglang
+  namespace: llm-d-async
+  labels:
+    app: sglang-1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sglang-1
+  template:
+    metadata:
+      labels:
+        app: sglang-1
+        model: qwen3-32b
+        inference_pool: llm-d-router
+    spec:
+      # Run the container inside a GKE Sandbox (gVisor) user-space kernel. This
+      # is what makes the pod checkpointable: podsnapshot.gke.io drives the
+      # freeze through gVisor, so without this runtime class the snapshot
+      # machinery is inert.
+      runtimeClassName: gvisor
+      # `--sandbox type=gvisor` node pools carry this label. Without the
+      # selector the pod can land on a non-sandboxed node and stay Pending with
+      # an unsatisfiable RuntimeClass. The H100 itself comes from the node pool
+      # (`--accelerator=type=nvidia-h100-80gb,count=1`), not from a selector.
+      nodeSelector:
+        sandbox.gke.io/runtime: gvisor
+      containers:
+      - name: sglang-server
+        image: lmsysorg/sglang:latest
+        command: ["python3", "-m", "sglang.launch_server"]
+        args:
+        - "--model-path"
+        - "Qwen/Qwen3-32B"
+        # sglang.launch_server binds 127.0.0.1 by default. Under gVisor that
+        # loopback lives inside the sandbox's own network stack, so kubelet
+        # probes and Service traffic would both get connection refused.
+        - "--host"
+        - "0.0.0.0"
+        # Single H100 80GB: one rank, no tensor parallelism. Scale capacity
+        # horizontally with replicas, not with GPUs per replica -- the snapshot
+        # path only covers single-rank pods.
+        - "--tp"
+        - "1"
+        - "--mem-fraction-static"
+        - "0.90"
+        - "--disable-custom-all-reduce"  # Not supported
+        - "--port"
+        - "30000"
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-secret
+              key: token
+        ports:
+        - name: modelserver
+          containerPort: 30000
+          protocol: TCP
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+            cpu: "16"
+            memory: "128Gi"
+          requests:
+            nvidia.com/gpu: "1"
+            cpu: "8"
+            memory: "96Gi"
+        # Qwen3-32B has to be pulled and loaded before the server answers, so
+        # the Kubernetes default 30s startup budget is far too short.
+        # 540 x 5s = 45m.
+        startupProbe:
+          httpGet:
+            path: /health
+            port: modelserver
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 540
+        readinessProbe:
+          httpGet:
+            path: /v1/models
+            port: modelserver
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: modelserver
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 20Gi
