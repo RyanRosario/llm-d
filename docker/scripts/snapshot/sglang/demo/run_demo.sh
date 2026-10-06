@@ -4,7 +4,19 @@
 # and the SGLang snapshot wrapper/launcher/provider logs.
 #
 # Usage:
-#   ./docker/scripts/snapshot/sglang/demo/run_demo.sh [preflight|provision|setup|deploy|scale|verify|report|cleanup|all]
+#   ./docker/scripts/snapshot/sglang/demo/run_demo.sh [preflight|provision|setup|reset|deploy|scale|verify|report|cleanup|all]
+#
+# The script clears the previous run's state before the demo, not after it: `all` runs setup,
+# reset, deploy, scale, verify, and a standalone `deploy` runs reset first. The reset deletes the
+# SGLang Deployment and its pods, leftover helper pods, every PodSnapshot and event in NAMESPACE,
+# and every object and folder in GCS_BUCKET. It also removes the SGLang image from each
+# NODE_POOL_NAME node and drops the node's page cache, so that Pod 1 is a true cold start. Each
+# deletion is verified; the script stops at the first failure.
+#
+# Environment:
+#   REUSE_SNAPSHOT=1     skip the reset; Pod 1 may restore from the existing snapshot.
+#   CLEAR_NODE_CACHES=0  keep the image and page cache on the nodes (no privileged cleaner pod).
+#   INTERACTIVE=0        do not pause between steps or before the reset.
 
 set -euo pipefail
 
@@ -24,7 +36,21 @@ MAX_NODES="${MAX_NODES:-2}"
 DISK_SIZE="${DISK_SIZE:-200GB}"
 MODEL="${MODEL:-Qwen/Qwen3-32B}"
 CURL_TEST_IMAGE="${CURL_TEST_IMAGE:-cfmanteiga/alpine-bash-curl-jq:latest}"
+NODE_CLEANER_IMAGE="${NODE_CLEANER_IMAGE:-alpine:3.20}"
+CLEAR_NODE_CACHES="${CLEAR_NODE_CACHES:-1}"
+REUSE_SNAPSHOT="${REUSE_SNAPSHOT:-0}"
 ACTION="${1:-all}"
+
+OVERLAY_DIR="${REPO_ROOT}/guides/${GUIDE_NAME}/modelserver/gpu/gke/sglang"
+DEPLOYMENT="gke-pod-snapshots-nvidia-gpu-sglang-decode"
+POD_SELECTOR="llm-d.ai/guide=${GUIDE_NAME},llm-d.ai/engine-type=sglang"
+# Set by step_reset, so `all` does not reset twice.
+RESET_DONE=0
+
+# Allow-lists for values that reach gcloud, kubectl and the privileged node cleaner.
+BUCKET_RE='^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$'
+IMAGE_RE='^[a-z0-9][a-z0-9._-]*(:[0-9]+)?(/[a-z0-9][a-z0-9._-]*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(@sha256:[a-f0-9]{64})?$'
+K8S_NAME_RE='^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$'
 
 # Source common guide variables (GAIE_URL, ROUTER_STANDALONE_CHART, ROUTER_CHART_VERSION, etc.)
 # shellcheck disable=SC1091
@@ -38,8 +64,9 @@ banner() {
 }
 
 pause_step() {
+  local prompt="${1:-Press [Enter] to continue to the next step (or Ctrl+C to stop)...}"
   if [[ "${INTERACTIVE:-1}" == "1" ]]; then
-    read -r -p $'\n>>> Press [Enter] to continue to the next step (or Ctrl+C to stop)... '
+    read -r -p $'\n>>> '"${prompt} "
   fi
 }
 
@@ -49,6 +76,11 @@ require_var() {
     echo "ERROR: Environment variable ${var_name} must be set." >&2
     exit 1
   fi
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
 }
 
 # Print a comprehensive timing summary for a pod by parsing both K8s Pod/PodSnapshot
@@ -525,40 +557,238 @@ step_setup() {
   echo ">>> Step 1 (setup) finished in $(( SECONDS - t_start ))s."
 }
 
+# Prints the distinct images of the model server Deployment rendered from OVERLAY_DIR, one per line.
+modelserver_images() {
+  kubectl kustomize "${OVERLAY_DIR}" | python3 -c '
+import re
+import sys
+
+docs = [d for d in re.split(r"(?m)^---\s*$", sys.stdin.read())
+        if re.search(r"(?m)^kind: Deployment\s*$", d)]
+if len(docs) != 1:
+    sys.exit(f"expected 1 Deployment in the rendered overlay, found {len(docs)}")
+images = re.findall(r"(?m)^\s*(?:- )?image:\s*\"?([^\"\s]+)\"?\s*$", docs[0])
+if not images:
+    sys.exit("found no image in the rendered Deployment")
+print("\n".join(dict.fromkeys(images)))
+'
+}
+
+# Waits until `kubectl get KIND [-l SELECTOR]` in NAMESPACE returns nothing; fails after TIMEOUT_S.
+wait_until_gone() {
+  local kind="$1" selector="$2" timeout_s="$3" left
+  local deadline=$(( SECONDS + timeout_s ))
+  local args=(get "${kind}" -n "${NAMESPACE}" -o name)
+  if [[ -n "${selector}" ]]; then
+    args+=(-l "${selector}")
+  fi
+  while true; do
+    left="$(kubectl "${args[@]}")" || return 1
+    if [[ -z "${left}" ]]; then
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "Still present after ${timeout_s}s: ${left//$'\n'/ }" >&2
+      return 1
+    fi
+    sleep 5
+  done
+}
+
+# Prints the top-level objects and folders of gs://GCS_BUCKET, one per line; nothing if empty.
+gcs_top_level() {
+  local out err rc=0
+  err="$(mktemp)"
+  out="$(gcloud storage ls "gs://${GCS_BUCKET}" 2>"${err}")" || rc=$?
+  if (( rc != 0 )) && ! grep -q "matched no objects" "${err}"; then
+    cat "${err}" >&2
+    rm -f "${err}"
+    return 1
+  fi
+  rm -f "${err}"
+  if [[ -n "${out}" ]]; then
+    printf '%s\n' "${out}"
+  fi
+}
+
+# Deletes every object, object version and folder in gs://GCS_BUCKET, but never the bucket, and
+# verifies that it is empty. Retries, since objects can change or disappear while being deleted.
+clear_bucket() {
+  local listing entries=() entry attempt
+  for attempt in 1 2 3 4; do
+    listing="$(gcs_top_level)" || die "could not list gs://${GCS_BUCKET}"
+    if [[ -z "${listing}" ]]; then
+      echo "  [OK] gs://${GCS_BUCKET} is empty."
+      return 0
+    fi
+    if (( attempt == 4 )); then
+      break
+    fi
+    mapfile -t entries <<<"${listing}"
+    for entry in "${entries[@]}"; do
+      # rm --recursive on the bucket URL itself would delete the bucket.
+      [[ "${entry}" == "gs://${GCS_BUCKET}/"?* ]] || die "refusing to delete unexpected entry '${entry}'"
+    done
+    echo "Deleting ${#entries[@]} top-level object(s)/folder(s) from gs://${GCS_BUCKET}..."
+    gcloud storage rm --recursive "${entries[@]}" \
+      || echo "WARNING: gcloud storage rm reported errors; checking the bucket again..." >&2
+  done
+  die "gs://${GCS_BUCKET} is still not empty: ${listing//$'\n'/ }"
+}
+
+# TODO(security): runs a privileged, hostPID pod on every NODE_POOL_NAME node that enters the
+# host's namespaces to remove the model server image(s) from containerd and drop the page cache,
+# so Pod 1 is a true cold start. Demo clusters only; CLEAR_NODE_CACHES=0 skips it. Node names and
+# images are validated and passed as positional parameters, never spliced into the script.
+clear_node_caches() {
+  local listing nodes=() node overrides script i=0
+  listing="$(kubectl get nodes -l "cloud.google.com/gke-nodepool=${NODE_POOL_NAME}" \
+    -o jsonpath='{.items[*].metadata.name}')" || die "could not list the ${NODE_POOL_NAME} nodes"
+  read -r -a nodes <<<"${listing}"
+  if (( ${#nodes[@]} == 0 )); then
+    echo "  [OK] ${NODE_POOL_NAME} has no nodes; the autoscaler will provision a fresh one."
+    return 0
+  fi
+  # COS keeps crictl in /home/kubernetes/bin, which is not on the default PATH.
+  script="$(cat <<'SH'
+node="$1"; shift
+export PATH="/home/kubernetes/bin:$PATH"
+export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
+export IMAGE_SERVICE_ENDPOINT=unix:///run/containerd/containerd.sock
+cached() { crictl inspecti -o json "$1" 2>/dev/null | grep -q '"id"'; }
+if ! crictl images >/dev/null; then
+  echo "  [FAIL] crictl cannot list the images on $node" >&2
+  exit 1
+fi
+rc=0
+for image in "$@"; do
+  if ! cached "$image"; then
+    echo "  [OK] $image is not cached on $node"
+  elif crictl rmi "$image" >/dev/null && ! cached "$image"; then
+    echo "  [OK] removed $image from $node"
+  else
+    echo "  [FAIL] could not remove $image from $node" >&2
+    rc=1
+  fi
+done
+if sync && echo 3 >/proc/sys/vm/drop_caches; then
+  echo "  [OK] dropped the page cache on $node"
+else
+  echo "  [FAIL] could not drop the page cache on $node" >&2
+  rc=1
+fi
+exit "$rc"
+SH
+)"
+  for node in "${nodes[@]}"; do
+    [[ "${node}" =~ ${K8S_NAME_RE} ]] || die "unexpected node name '${node}'"
+    overrides="$(python3 - "${node}" "${NODE_CLEANER_IMAGE}" "${script}" "$@" <<'PY'
+import json
+import sys
+
+node, image, script, *images = sys.argv[1:]
+print(json.dumps({
+    "apiVersion": "v1",
+    "spec": {
+        "nodeName": node,
+        "hostPID": True,
+        "automountServiceAccountToken": False,
+        "tolerations": [{"operator": "Exists"}],
+        "containers": [{
+            "name": "cleaner",
+            "image": image,
+            "securityContext": {"privileged": True},
+            # The node name and images are positional parameters of sh -c, never script text.
+            "command": ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "--",
+                        "/bin/sh", "-c", script, "sh", node, *images],
+        }],
+    },
+}))
+PY
+)" || die "could not build the cleaner pod spec for ${node}"
+    echo "Clearing ${node}..."
+    kubectl run "cache-cleaner-${i}-${node##*-}" -n "${NAMESPACE}" --rm --attach --restart=Never \
+      --pod-running-timeout=5m --image="${NODE_CLEANER_IMAGE}" --overrides="${overrides}" \
+      || die "could not clear the caches on ${node} (CLEAR_NODE_CACHES=0 skips this step)"
+    i=$(( i + 1 ))
+  done
+}
+
+step_reset() {
+  require_var GCS_BUCKET
+  [[ "${GCS_BUCKET}" =~ ${BUCKET_RE} ]] || die "unexpected GCS_BUCKET '${GCS_BUCKET}'"
+  [[ "${NODE_CLEANER_IMAGE}" =~ ${IMAGE_RE} ]] || die "unexpected NODE_CLEANER_IMAGE '${NODE_CLEANER_IMAGE}'"
+
+  banner "Reset: Clear PodSnapshots, GCS Objects, Cached Image & Page Cache for a Fresh Cold Start"
+
+  local listing images=() image helper_pods=()
+  listing="$(modelserver_images)" || die "could not read the model server image(s) from ${OVERLAY_DIR}"
+  mapfile -t images <<<"${listing}"
+  for image in "${images[@]}"; do
+    [[ "${image}" =~ ${IMAGE_RE} ]] || die "unexpected image reference '${image}' in ${OVERLAY_DIR}"
+  done
+
+  echo "This deletes:"
+  echo "  - Deployment ${DEPLOYMENT} (and the legacy sglang-decode) and their pods in ${NAMESPACE}"
+  echo "  - leftover curl-test and cache-cleaner pods from interrupted runs"
+  echo "  - every PodSnapshot in ${NAMESPACE}"
+  echo "  - every object, object version and folder in gs://${GCS_BUCKET}"
+  if [[ "${CLEAR_NODE_CACHES}" == "1" ]]; then
+    echo "  - ${images[*]} and the page cache on every ${NODE_POOL_NAME} node (privileged pod)"
+  fi
+  echo "  - every event in ${NAMESPACE}"
+  pause_step "Press [Enter] to delete all of the above (or Ctrl+C to stop)..."
+
+  local t_start=$SECONDS
+  kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+  echo "Deleting the SGLang Deployment and waiting for its pods to terminate..."
+  kubectl delete deployment "${DEPLOYMENT}" sglang-decode -n "${NAMESPACE}" \
+    --ignore-not-found=true --wait=true --timeout=120s || die "could not delete the SGLang Deployment"
+  wait_until_gone pods "${POD_SELECTOR}" 300 || die "could not confirm that the SGLang pods are gone"
+
+  listing="$(kubectl get pods -n "${NAMESPACE}" -o name)" || die "could not list the pods in ${NAMESPACE}"
+  mapfile -t helper_pods < <(grep -E '^pod/(curl-test|cache-cleaner-[a-z0-9-]+)$' <<<"${listing}" || true)
+  if (( ${#helper_pods[@]} > 0 )); then
+    echo "Deleting leftover helper pods: ${helper_pods[*]}"
+    kubectl delete -n "${NAMESPACE}" --ignore-not-found=true --wait=true --timeout=120s "${helper_pods[@]}" \
+      || die "could not delete the leftover helper pods"
+  fi
+
+  echo "Deleting PodSnapshots..."
+  kubectl delete podsnapshots --all -n "${NAMESPACE}" --wait=true --timeout=300s \
+    || die "could not delete the PodSnapshots in ${NAMESPACE}"
+  wait_until_gone podsnapshots "" 60 || die "could not confirm that the PodSnapshots are gone"
+
+  echo "Emptying gs://${GCS_BUCKET}..."
+  clear_bucket
+
+  if [[ "${CLEAR_NODE_CACHES}" == "1" ]]; then
+    echo "Removing the image(s) and dropping the page cache on the ${NODE_POOL_NAME} nodes..."
+    clear_node_caches "${images[@]}"
+  else
+    echo "WARNING: CLEAR_NODE_CACHES=0: the nodes keep the image and page cache; Pod 1 may start warm." >&2
+  fi
+
+  kubectl delete events --all -n "${NAMESPACE}" >/dev/null \
+    || echo "WARNING: could not delete the old events; step 3 may list events from earlier runs." >&2
+
+  RESET_DONE=1
+  echo ">>> Reset finished in $(( SECONDS - t_start ))s."
+}
+
 step_deploy() {
   require_var GCS_BUCKET
 
+  # Pod 1 must cold start; `all` has already reset by this point.
+  if [[ "${REUSE_SNAPSHOT}" == "1" ]]; then
+    echo "REUSE_SNAPSHOT=1: skipping the reset; Pod 1 may restore from the existing snapshot instead of cold starting."
+  elif [[ "${RESET_DONE}" != "1" ]]; then
+    step_reset
+  fi
+
   local t_start=$SECONDS
   banner "Step 2 (Act I): Deploy SGLang Model Server & Create Initial PodSnapshot (Cold Start)"
-
-  # Clean up any existing deployment pods and stale PodSnapshots so Pod 1 performs
-  # a true cold start with the latest ConfigMap scripts and avoids racing with
-  # terminating pods from a previous run.
-  if [[ "${REUSE_SNAPSHOT:-0}" != "1" ]]; then
-    echo "Cleaning up any pre-existing SGLang deployments, stale PodSnapshots, GCS bucket objects, and node caches for a fresh cold start..."
-    kubectl delete deployment gke-pod-snapshots-nvidia-gpu-sglang-decode sglang-decode -n "${NAMESPACE}" --ignore-not-found=true --wait=true
-    kubectl wait --for=delete pod -l "llm-d.ai/guide=${GUIDE_NAME},llm-d.ai/engine-type=sglang" -n "${NAMESPACE}" --timeout=120s 2>/dev/null || true
-    kubectl delete podsnapshots --all -n "${NAMESPACE}" --ignore-not-found=true --wait=true
-    gcloud storage rm -r "gs://${GCS_BUCKET}/**" 2>/dev/null || true
-
-    for node in $(kubectl get nodes -l "cloud.google.com/gke-nodepool=${NODE_POOL_NAME}" -o jsonpath='{.items[*].metadata.name}'); do
-      kubectl run "cache-cleaner-${node##*-}" -n "${NAMESPACE}" --rm -i --restart=Never \
-        --image=alpine:3.20 \
-        --overrides="{
-          \"spec\": {
-            \"nodeName\": \"${node}\",
-            \"hostPID\": true,
-            \"tolerations\": [{\"operator\": \"Exists\"}],
-            \"containers\": [{
-              \"name\": \"cleaner\",
-              \"image\": \"alpine:3.20\",
-              \"securityContext\": {\"privileged\": true},
-              \"command\": [\"nsenter\", \"-t\", \"1\", \"-m\", \"-u\", \"-i\", \"-n\", \"--\", \"/bin/sh\", \"-c\", \"crictl rmi docker.io/lmsysorg/sglang:v0.5.19 2>/dev/null || true; sync; echo 3 > /proc/sys/vm/drop_caches; echo Cleared caches on ${node}\"]
-            }]
-          }
-        }"
-    done
-  fi
 
   kubectl kustomize "${REPO_ROOT}/guides/${GUIDE_NAME}/modelserver/gpu/gke/sglang/" \
     | sed "s/gcs-bucket-placeholder/${GCS_BUCKET}/g" \
@@ -660,6 +890,9 @@ case "${ACTION}" in
   setup)
     step_setup
     ;;
+  reset)
+    step_reset
+    ;;
   deploy)
     step_deploy
     ;;
@@ -677,6 +910,10 @@ case "${ACTION}" in
     ;;
   all)
     step_setup
+    # step_reset pauses before deleting, which doubles as the pause after setup.
+    if [[ "${REUSE_SNAPSHOT}" != "1" ]]; then
+      step_reset
+    fi
     pause_step
     step_deploy
     pause_step
@@ -685,7 +922,7 @@ case "${ACTION}" in
     step_verify
     ;;
   *)
-    echo "Usage: $0 [preflight|provision|setup|deploy|scale|verify|report|cleanup|all]" >&2
+    echo "Usage: $0 [preflight|provision|setup|reset|deploy|scale|verify|report|cleanup|all]" >&2
     exit 1
     ;;
 esac

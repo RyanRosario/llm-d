@@ -18,6 +18,7 @@ You can run the entire demo or individual stages using [`run_demo.sh`](run_demo.
 ```bash
 ./docker/scripts/snapshot/sglang/demo/run_demo.sh preflight  # Step 0: Verify cluster, GPU gVisor node pool, CRDs & GCS bucket
 ./docker/scripts/snapshot/sglang/demo/run_demo.sh setup      # Step 1: Configure GCS IAM, namespace, secret & router
+./docker/scripts/snapshot/sglang/demo/run_demo.sh reset      # Clear snapshots, GCS bucket, node image & page cache (deploy runs this first)
 ./docker/scripts/snapshot/sglang/demo/run_demo.sh deploy     # Step 2 (Act I): Clean cold start & snapshot creation on Pod 1
 ./docker/scripts/snapshot/sglang/demo/run_demo.sh scale      # Step 3 (Act II): Scale to 2 replicas & restore Pod 2 from GCS
 ./docker/scripts/snapshot/sglang/demo/run_demo.sh verify     # Step 4 (Act III): Send live inference request to restored Pod 2
@@ -130,31 +131,10 @@ helm upgrade --install ${GUIDE_NAME} \
 
 ### 1. Clear All Caches & Deploy the SGLang Kustomize Overlay
 
-Delete any previous SGLang deployment and stale `PodSnapshot` objects, empty the GCS snapshot bucket, and clear the cached container image (`crictl rmi`) and kernel page cache (`drop_caches`) on each GPU node so Pod 1 performs a completely clean cold start:
+Reset the cluster so Pod 1 performs a completely clean cold start. The reset deletes any previous SGLang deployment, leftover helper pods, and stale `PodSnapshot` objects. It empties the GCS snapshot bucket (objects, object versions, and folders) and removes the cached container image (`crictl rmi`) and kernel page cache (`drop_caches`) on each GPU node. It verifies each step and stops at the first failure:
 
 ```bash
-kubectl delete deployment gke-pod-snapshots-nvidia-gpu-sglang-decode sglang-decode -n ${NAMESPACE} --ignore-not-found=true --wait=true
-kubectl delete podsnapshots --all -n ${NAMESPACE} --ignore-not-found=true --wait=true
-gcloud storage rm -r "gs://${GCS_BUCKET}/**" 2>/dev/null || true
-
-# Clear container image cache & kernel page cache on all GPU nodes
-for node in $(kubectl get nodes -l cloud.google.com/gke-nodepool=${NODE_POOL_NAME} -o jsonpath='{.items[*].metadata.name}'); do
-  kubectl run "cache-cleaner-${node##*-}" -n "${NAMESPACE}" --rm -i --restart=Never \
-    --image=alpine:3.20 \
-    --overrides="{
-      \"spec\": {
-        \"nodeName\": \"${node}\",
-        \"hostPID\": true,
-        \"tolerations\": [{\"operator\": \"Exists\"}],
-        \"containers\": [{
-          \"name\": \"cleaner\",
-          \"image\": \"alpine:3.20\",
-          \"securityContext\": {\"privileged\": true},
-          \"command\": [\"nsenter\", \"-t\", \"1\", \"-m\", \"-u\", \"-i\", \"-n\", \"--\", \"/bin/sh\", \"-c\", \"crictl rmi docker.io/lmsysorg/sglang:v0.5.19 2>/dev/null || true; sync; echo 3 > /proc/sys/vm/drop_caches; echo Cleared caches on ${node}\"]
-        }]
-      }
-    }"
-done
+./docker/scripts/snapshot/sglang/demo/run_demo.sh reset
 
 kubectl kustomize ${REPO_ROOT}/guides/${GUIDE_NAME}/modelserver/gpu/gke/sglang/ \
   | sed "s/gcs-bucket-placeholder/${GCS_BUCKET}/g" \
