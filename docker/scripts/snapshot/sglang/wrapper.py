@@ -4,8 +4,10 @@ SGLang Wrapper Entrypoint for GKE Fast Pod Snapshotting (docker/scripts/snapshot
 Note: Scope is single-rank deployments (DP/multi-rank barrier coordination is not covered).
 
 Patches sglang.srt.entrypoints.http_server._wait_and_warmup to:
-1. Run standard server warmup (captures CUDA graphs, pre-allocates VRAM, and freezes GC).
-2. Release physical VRAM via tokenizer_manager.release_memory_occupation(tags=["weights", "kv_cache"]).
+1. Run standard server warmup (captures CUDA graphs, pre-allocates VRAM, and freezes GC), setting
+   tokenizer_manager.server_status back to Starting as soon as warmup returns so /health stays at 503.
+2. Wait for the scheduler to become idle via tokenizer_manager.flush_cache(timeout_s=...), then release
+   physical VRAM via tokenizer_manager.release_memory_occupation(tags=["weights", "kv_cache"]).
 3. Trigger the snapshot checkpoint via snapshot_provider.trigger() (clearing model weights cache on disk).
 4. Re-allocate physical VRAM via tokenizer_manager.resume_memory_occupation(tags=["weights", "kv_cache"]) upon restore.
 5. Mark tokenizer_manager.server_status = ServerStatus.Up and invoke launch_callback to begin serving traffic.
@@ -40,6 +42,9 @@ if not logger.handlers:
     logger.addHandler(_handler)
     logger.setLevel(logging.INFO)
     logger.propagate = False
+
+# How long to wait for SGLang's scheduler to become idle before releasing GPU memory.
+SCHEDULER_IDLE_TIMEOUT_S = 60.0
 
 
 def patch_sglang_wait_and_warmup(snapshot_provider: Optional[GKESnapshotProvider] = None):
@@ -123,6 +128,8 @@ def patch_sglang_wait_and_warmup(snapshot_provider: Optional[GKESnapshotProvider
                 get_exec().moe.ep_join_mode,
             )
 
+        tokenizer_manager = http_server._global_state.tokenizer_manager
+
         # Warmup captures CUDA graphs and pre-allocates VRAM
         if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
             t_warmup = time.monotonic()
@@ -130,6 +137,10 @@ def patch_sglang_wait_and_warmup(snapshot_provider: Optional[GKESnapshotProvider
             if not execute_warmup_func(server_args):
                 logger.error("[Control Plane] Server warmup failed; aborting before snapshot checkpoint.")
                 return
+            # A successful warmup sets server_status to Up. Set it back to Starting at once, before
+            # logging or freezing GC: while the status is Up, /health runs a real request on the
+            # scheduler, and the scheduler must be idle when GPU memory is released below.
+            tokenizer_manager.server_status = ServerStatus.Starting
             logger.info(
                 "[Control Plane] Server warmup completed in %.2fs (cold-start elapsed_since_start=%.2fs).",
                 time.monotonic() - t_warmup,
@@ -137,6 +148,13 @@ def patch_sglang_wait_and_warmup(snapshot_provider: Optional[GKESnapshotProvider
             )
         else:
             logger.warning("[Control Plane] Warmup skipped.")
+
+        # Already Starting after a warmup; set it here too in case warmup was skipped.
+        tokenizer_manager.server_status = ServerStatus.Starting
+        logger.info(
+            "[Control Plane] Set tokenizer_manager.server_status = %s (keeping /health at 503 during sleep/checkpoint).",
+            tokenizer_manager.server_status,
+        )
 
         t_gc = time.monotonic()
         logger.info("[Control Plane] Freezing Python garbage collection after server warmup...")
@@ -146,11 +164,30 @@ def patch_sglang_wait_and_warmup(snapshot_provider: Optional[GKESnapshotProvider
             time.monotonic() - t_gc,
         )
 
-        tokenizer_manager = http_server._global_state.tokenizer_manager
-        tokenizer_manager.server_status = ServerStatus.Starting
+        # SGLang's scheduler asserts that it is idle when asked to release memory, and dies if it
+        # is not. With the status at Starting, /health no longer sends it requests, but one sent
+        # earlier (while warmup had set Up) may still be queued. flush_cache with a timeout waits
+        # in the scheduler until it is idle.
+        t_idle = time.monotonic()
         logger.info(
-            "[Control Plane] Set tokenizer_manager.server_status = %s (keeping /health at 503 during sleep/checkpoint).",
-            tokenizer_manager.server_status,
+            "[Control Plane] Waiting up to %.0fs for the SGLang scheduler to become idle...",
+            SCHEDULER_IDLE_TIMEOUT_S,
+        )
+        flushed = asyncio.run_coroutine_threadsafe(
+            tokenizer_manager.flush_cache(timeout_s=SCHEDULER_IDLE_TIMEOUT_S),
+            tokenizer_manager.event_loop,
+        ).result()
+        if not flushed.success:
+            logger.error(
+                "[Control Plane] The SGLang scheduler did not become idle (%s). Terminating SGLang server (pid=%d).",
+                getattr(flushed, "message", "") or "no reason given",
+                os.getpid(),
+            )
+            kill_process_tree(os.getpid())
+            return
+        logger.info(
+            "[Control Plane] The SGLang scheduler is idle (waited %.2fs).",
+            time.monotonic() - t_idle,
         )
 
         # SLEEP

@@ -555,7 +555,10 @@ class TestSGLangWrapper(unittest.TestCase):
             self.assertEqual(mock_http_server._wait_and_warmup, orig_wait)
 
     def test_patch_sglang_wait_and_warmup_sleep_trigger_wake(self):
-        from docker.scripts.snapshot.sglang.wrapper import patch_sglang_wait_and_warmup
+        from docker.scripts.snapshot.sglang.wrapper import (
+            SCHEDULER_IDLE_TIMEOUT_S,
+            patch_sglang_wait_and_warmup,
+        )
 
         mock_http_server = self._make_mock_http_server()
         orig_wait = mock_http_server._wait_and_warmup
@@ -566,12 +569,24 @@ class TestSGLangWrapper(unittest.TestCase):
         events = []
         status_during_phases = {}
         tokenizer_mgr = mock_http_server._global_state.tokenizer_manager
-        mock_http_server._execute_server_warmup.side_effect = (
-            lambda *a, **kw: events.append("warmup") or True
-        )
-        mock_http_server._freeze_gc_after_server_warmup.side_effect = (
-            lambda *a, **kw: events.append("freeze_gc")
-        )
+
+        def _warmup(*args, **kwargs):
+            # Like SGLang's warmup, set the status to Up on success.
+            tokenizer_mgr.server_status = mock_http_server.ServerStatus.Up
+            events.append("warmup")
+            return True
+
+        def _freeze_gc(*args, **kwargs):
+            status_during_phases["freeze_gc"] = tokenizer_mgr.server_status
+            events.append("freeze_gc")
+
+        mock_http_server._execute_server_warmup.side_effect = _warmup
+        mock_http_server._freeze_gc_after_server_warmup.side_effect = _freeze_gc
+
+        async def _async_flush(timeout_s=None):
+            status_during_phases["flush"] = tokenizer_mgr.server_status
+            events.append("flush")
+            return MagicMock(success=True, message="")
 
         async def _async_release(req):
             status_during_phases["release"] = tokenizer_mgr.server_status
@@ -585,6 +600,7 @@ class TestSGLangWrapper(unittest.TestCase):
             status_during_phases["resume"] = tokenizer_mgr.server_status
             events.append("resume")
 
+        tokenizer_mgr.flush_cache.side_effect = _async_flush
         tokenizer_mgr.release_memory_occupation.side_effect = _async_release
         mock_provider.trigger.side_effect = _trigger
         tokenizer_mgr.resume_memory_occupation.side_effect = _async_resume
@@ -601,21 +617,27 @@ class TestSGLangWrapper(unittest.TestCase):
                 execute_warmup_func=mock_http_server._execute_server_warmup,
             )
 
+        # The scheduler must be idle before release_memory_occupation, which asserts it.
         self.assertEqual(
             events,
-            ["warmup", "freeze_gc", "release", "trigger", "resume", "callback"],
+            ["warmup", "freeze_gc", "flush", "release", "trigger", "resume", "callback"],
         )
+        # While the status is Up, /health sends requests to the scheduler. Freezing GC blocks the
+        # HTTP server, and probes that queue up behind it must not see Up.
         self.assertEqual(
             status_during_phases,
             {
+                "freeze_gc": mock_http_server.ServerStatus.Starting,
+                "flush": mock_http_server.ServerStatus.Starting,
                 "release": mock_http_server.ServerStatus.Starting,
                 "trigger": mock_http_server.ServerStatus.Starting,
                 "resume": mock_http_server.ServerStatus.Starting,
             },
         )
-        self.assertEqual(self.mock_run_threadsafe.call_count, 2)
+        self.assertEqual(self.mock_run_threadsafe.call_count, 3)
         for call in self.mock_run_threadsafe.call_args_list:
             self.assertEqual(call[0][1], tokenizer_mgr.event_loop)
+        tokenizer_mgr.flush_cache.assert_called_once_with(timeout_s=SCHEDULER_IDLE_TIMEOUT_S)
         tokenizer_mgr.release_memory_occupation.assert_called_once_with(
             {"type": "release", "tags": ["weights", "kv_cache"]}
         )
@@ -625,6 +647,42 @@ class TestSGLangWrapper(unittest.TestCase):
         )
         self.assertEqual(tokenizer_mgr.server_status, mock_http_server.ServerStatus.Up)
         mock_callback.assert_called_once()
+
+    def test_patch_sglang_wait_and_warmup_scheduler_not_idle_terminates(self):
+        from docker.scripts.snapshot.sglang.wrapper import patch_sglang_wait_and_warmup
+
+        mock_http_server = self._make_mock_http_server()
+        mock_provider = MagicMock(spec=GKESnapshotProvider)
+        mock_provider.is_available.return_value = True
+        mock_callback = MagicMock()
+        tokenizer_mgr = mock_http_server._global_state.tokenizer_manager
+
+        async def _async_flush(timeout_s=None):
+            return MagicMock(success=False, message="Timed out waiting for idle state.")
+
+        tokenizer_mgr.flush_cache.side_effect = _async_flush
+
+        modules = self._make_sglang_modules(mock_http_server)
+        with patch.dict("sys.modules", modules), patch(
+            "os.getpid", return_value=9999
+        ), patch("docker.scripts.snapshot.sglang.wrapper.logger") as mock_logger:
+            patch_sglang_wait_and_warmup(snapshot_provider=mock_provider)
+            mock_http_server._wait_and_warmup(
+                MagicMock(is_ep_scale_joiner=False),
+                launch_callback=mock_callback,
+                execute_warmup_func=mock_http_server._execute_server_warmup,
+            )
+
+            mock_logger.error.assert_called_once()
+            self.assertIn("did not become idle", mock_logger.error.call_args[0][0])
+
+        # Releasing memory on a busy scheduler would kill it, so nothing is released.
+        mock_http_server.kill_process_tree.assert_called_once_with(9999)
+        tokenizer_mgr.release_memory_occupation.assert_not_called()
+        mock_provider.trigger.assert_not_called()
+        tokenizer_mgr.resume_memory_occupation.assert_not_called()
+        self.assertNotEqual(tokenizer_mgr.server_status, mock_http_server.ServerStatus.Up)
+        mock_callback.assert_not_called()
 
     def test_patch_sglang_wait_and_warmup_wait_weights_ready(self):
         from docker.scripts.snapshot.sglang.wrapper import patch_sglang_wait_and_warmup
