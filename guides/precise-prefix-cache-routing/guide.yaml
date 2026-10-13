@@ -101,10 +101,16 @@ prerequisites:
 
 deploy:
   router_values:
-    - run: |
+    - when: {MODEL_SERVER: [vllm]}
+      run: |
         # Paths to values files
         export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
         export ROUTER_VALUES="${REPO_ROOT}/guides/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml"
+    - when: {MODEL_SERVER: [sglang]}
+      run: |
+        # Paths to values files
+        export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
+        export ROUTER_VALUES="${REPO_ROOT}/guides/${GUIDE_NAME}/router/${GUIDE_NAME}-sglang.values.yaml"
 
   monitoring_values:
     - when: {MONITORING: ["true"]}

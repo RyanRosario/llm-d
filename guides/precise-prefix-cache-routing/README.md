@@ -126,15 +126,34 @@ kubectl create secret generic llm-d-hf-token \
 **Prepare the paths to the `helm` values files** for the `llm-d` router (used in the deployment command below):
 
 <!-- guide:deploy.router_values start -->
+<!-- variants:start -->
+<details open data-when="MODEL_SERVER=vllm">
+<summary><b>vLLM</b></summary>
+
 ```bash
 # Paths to values files
 export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
 export ROUTER_VALUES="${REPO_ROOT}/guides/${GUIDE_NAME}/router/${GUIDE_NAME}.values.yaml"
 ```
+
+</details>
+<details data-when="MODEL_SERVER=sglang">
+<summary><b>SGLang</b></summary>
+
+<!-- llm-d-cicd:skip start -->
+```bash
+# Paths to values files
+export ROUTER_BASE_VALUES="${REPO_ROOT}/guides/recipes/router/base.values.yaml"
+export ROUTER_VALUES="${REPO_ROOT}/guides/${GUIDE_NAME}/router/${GUIDE_NAME}-sglang.values.yaml"
+```
+<!-- llm-d-cicd:skip end -->
+
+</details>
+<!-- variants:end -->
 <!-- guide:deploy.router_values end -->
 
 > [!NOTE]
-> The `prefix-cache-affinity-filter` in [`router/precise-prefix-cache-routing.values.yaml`](router/precise-prefix-cache-routing.values.yaml) uses a `peakPrefillThroughput` measured on the reference setup (`Qwen3-32B` on H100 80&nbsp;GB, TP=2; SGLang measures the same value as vLLM). On a different model or accelerator, measure and set your value with the [calibration guide](../recipes/router/calibration/README.md).
+> The `prefix-cache-affinity-filter` in [`router/precise-prefix-cache-routing.values.yaml`](router/precise-prefix-cache-routing.values.yaml) (vLLM) and [`router/precise-prefix-cache-routing-sglang.values.yaml`](router/precise-prefix-cache-routing-sglang.values.yaml) (SGLang, which omits `replaySocketPort` as SGLang `v0.5.20` does not support ZMQ replay topics) uses a `peakPrefillThroughput` measured on the reference setup (`Qwen3-32B` on H100 80&nbsp;GB, TP=2; SGLang measures the same value as vLLM). On a different model or accelerator, measure and set your value with the [calibration guide](../recipes/router/calibration/README.md).
 
 **(Optional) Enable Prometheus monitoring on the `llm-d` router** by defining the `helm` values file (requires installing the monitoring stack mentioned in [Prerequisites](#prerequisites)):
 
@@ -324,7 +343,7 @@ If the requests are spread evenly and hit rates stay near zero, the router is no
 
 ## How It Works
 
-1. **Model server pods publish KV-cache events** — each pod (vLLM or SGLang) runs with `--kv-events-config '{...,"publisher":"zmq","endpoint":"$(KV_EVENTS_ENDPOINT)","topic":"kv@$(POD_IP):$(POD_PORT)@<model>"}'` and `KV_EVENTS_ENDPOINT=tcp://*:5556`, binding its own ZMQ socket. On every KV block allocation/eviction, the server emits a ZMQ message. The GPU vLLM backend (v0.26.0+) additionally binds a ZMQ ROUTER socket on port 5559 and retains the last 10,000 batches in an in-memory replay buffer for index recovery.
+1. **Model server pods publish KV-cache events** — each pod (vLLM or SGLang) runs with `--kv-events-config '{...,"publisher":"zmq","endpoint":"$(KV_EVENTS_ENDPOINT)","topic":"kv@$(POD_IP):$(POD_PORT)@<model>"}'` and `KV_EVENTS_ENDPOINT=tcp://*:5556`, binding its own ZMQ socket. On every KV block allocation/eviction, the server emits a ZMQ message. The vLLM backends (v0.26.0+) additionally bind a ZMQ ROUTER socket on port 5559 and retain the last 10,000 batches in an in-memory replay buffer for index recovery.
 2. **Router subscribes per pod** — pod discovery (`kvEventsConfig.discoverPods: true`) registers the `precise-prefix-cache-producer` as an extractor on the data-layer `endpoint-notification-source`, so each router replica installs a ZMQ subscriber per model server pod independently. All replicas converge to the same index. When a replay endpoint is available, each subscriber requests buffered events on first connect (or after a router restart) to rebuild its KV-block index without waiting for live traffic.
 3. **Router tokenizes the prompt** — before it can look the prefix up in that index, the `token-producer` plugin POSTs the prompt to the render Service to get exact token IDs.
 4. **Filter + score** — the `prefix-cache-affinity-filter` narrows candidates to the pods where the request's prefix blocks are resident (falling back to the least-loaded pods when the cache-warm set is saturated past `peakPrefillThroughput`), and the `token-load-scorer` picks the endpoint with the least in-flight token load among them.

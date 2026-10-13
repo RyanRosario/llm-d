@@ -1,0 +1,96 @@
+# Guides Values Slice: precise-prefix-cache-routing (SGLang)
+# Layer on top of `guides/recipes/router/base.values.yaml`.
+#
+# Precise prefix cache routing for SGLang: model servers publish KV-cache block
+# events over ZMQ (`--kv-events-config`), and the router subscribes to each pod
+# via pod discovery (`kvEventsConfig.discoverPods: true`) to maintain an exact
+# per-pod block index. Unlike vLLM (v0.26.0+), SGLang v0.5.20 does not include
+# the topic frame in ZMQ replay responses (sgl-project/sglang#43386), so
+# `replaySocketPort` is omitted and the router indexes live KV events directly.
+# Tokenization is served by the standalone CPU `vllm launch render` Deployment
+# (`../render/standalone/`), fronted by the `precise-prefix-cache-routing-render`
+# Service on port 8000.
+#
+# Key overrides from base:
+#   - Single-replica EPP: `token-load-scorer` tracks in-flight tokens locally
+#     per EPP instance, so running >1 replica splits load visibility across
+#     instances. Keep `replicas: 1` whenever `token-load-scorer` is active.
+#   - `token-producer` pointed at the guide's render Service, not a sidecar
+#   - `endpoint-notification-source` + `precise-prefix-cache-producer` with
+#     pod-discovery ZMQ (`socketPort: 5556`, live stream only)
+#   - `inflight-load-producer` + `prefix-cache-affinity-filter` + `token-load-scorer`
+#     with calibrated `peakPrefillThroughput`
+
+router:
+  epp:
+    # `token-load-scorer` is stateful in-memory per EPP process; multiple
+    # replicas would each see only their own share of in-flight tokens.
+    replicas: 1
+
+    pluginsConfigFile: "precise-prefix-cache-routing-plugins.yaml"
+    pluginsCustomConfig:
+      precise-prefix-cache-routing-plugins.yaml: |
+        apiVersion: llm-d.ai/v1
+        kind: EndpointPickerConfig
+        plugins:
+          - type: token-producer
+            parameters:
+              # Must match the model the render Deployment serves
+              # (`../render/standalone/deployment.yaml`).
+              modelName: Qwen/Qwen3-32B
+              vllm:
+                # Guide render Service (../render/standalone/), not a loopback sidecar.
+                # `precise-prefix-cache-routing-` namePrefix + Service name `render`.
+                url: "http://precise-prefix-cache-routing-render:8000"
+          - type: endpoint-notification-source
+          - type: precise-prefix-cache-producer
+            parameters:
+              tokenProcessorConfig:
+                blockSizeTokens: 64
+              speculativeIndexing: true
+              indexerConfig:
+                kvBlockIndexConfig:
+                  enableMetrics: true
+              kvEventsConfig:
+                topicFilter: "kv@"
+                concurrency: 8
+                discoverPods: true
+                podDiscoveryConfig:
+                  socketPort: 5556
+          - type: inflight-load-producer
+            parameters:
+              prefixMatchInfoProducerName: precise-prefix-cache-producer
+          - type: prefix-cache-affinity-filter
+            parameters:
+              # Exact resident-block fractions from KV-cache events, not the
+              # approximate producer.
+              prefixMatchInfoProducerName: precise-prefix-cache-producer
+              # Measured with guides/recipes/router/calibration/calibrate.sh on
+              # this guide's reference setup (Qwen3-32B, H100 80 GB, TP=2,
+              # chunk 8192) — SGLang measures the same value as vLLM. Re-measure
+              # for other hardware/models.
+              peakPrefillThroughput: 15926
+          - type: token-load-scorer
+        dataLayer: # metrics-data-source + core-metrics-extractor injected by default
+          sources:
+            - pluginRef: endpoint-notification-source
+              extractors:
+                - pluginRef: precise-prefix-cache-producer
+        schedulingProfiles:
+          - name: default
+            plugins:
+              - pluginRef: prefix-cache-affinity-filter
+              - pluginRef: token-load-scorer
+
+  extraServicePorts:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8081
+
+  modelServers:
+    type: vllm
+    targetPorts:
+      - number: 8000
+    matchLabels:
+      llm-d.ai/guide: "precise-prefix-cache-routing"
