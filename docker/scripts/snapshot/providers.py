@@ -7,10 +7,31 @@ This module provides GKESnapshotProvider for triggering gVisor sandbox checkpoin
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import pathlib
 import shutil
+import sys
+import time
 from typing import Optional
+
+try:
+    from vllm.logger import init_logger
+
+    logger = init_logger("vllm.snapshot.providers")
+except ImportError:
+    logger = logging.getLogger("snapshot.providers")
+    if not logger.handlers:
+        _handler = logging.StreamHandler(sys.stdout)
+        _handler.setFormatter(
+            logging.Formatter(
+                "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)d] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logger.addHandler(_handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
 
 GVISOR_CHECKPOINT_PATH = "/proc/gvisor/checkpoint"
 
@@ -46,16 +67,26 @@ class GKESnapshotProvider:
             return
 
         target_path = pathlib.Path(os.path.expanduser(self.cache_dir))
+        t0 = time.monotonic()
+        removed_count = 0
         try:
             if target_path.exists():
                 if target_path.is_file() or target_path.is_symlink():
                     target_path.unlink()
+                    removed_count = 1
                 else:
                     for child in target_path.iterdir():
                         if child.is_file() or child.is_symlink():
                             child.unlink()
                         else:
                             shutil.rmtree(child)
+                        removed_count += 1
+                logger.info(
+                    "Purged %d cache entry/entries from '%s' in %.2fs.",
+                    removed_count,
+                    target_path,
+                    time.monotonic() - t0,
+                )
         except OSError as e:
             raise SnapshotError(f"Could not delete locally stored weights at {target_path}: {e}") from e
 
@@ -78,11 +109,14 @@ class GKESnapshotProvider:
             raise SnapshotError(f"Failed to open gVisor checkpoint file '{self.proc_path}': {e}") from e
 
         try:
+            t0 = time.monotonic()
+            logger.info("Writing trigger byte to '%s' to initiate GKE Pod Snapshot...", self.proc_path)
             try:
                 os.write(fd, b"1")
             except OSError as e:
                 raise SnapshotError(f"Failed to write to gVisor checkpoint file: {e}") from e
 
+            logger.info("Waiting on '%s' barrier until checkpoint/restore completes...", self.proc_path)
             try:
                 # Attempting to read 1 byte blocks until checkpoint/restore completes.
                 # In gVisor, reading /proc/gvisor/checkpoint returns b"" (EOF) or b"r" (resumed) on success.
@@ -97,6 +131,12 @@ class GKESnapshotProvider:
 
             if res and res != b"r":
                 raise SnapshotError(f"gVisor checkpoint returned unexpected status: {res!r}")
+
+            logger.info(
+                "gVisor checkpoint completed successfully (barrier unblocked in %.2fs, status=%r).",
+                time.monotonic() - t0,
+                res,
+            )
         finally:
             os.close(fd)
 

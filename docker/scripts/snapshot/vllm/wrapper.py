@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -77,8 +78,13 @@ def patch_vllm_lifespan(app, snapshot_provider: Optional[GKESnapshotProvider] = 
 
             # Release physical VRAM maps (keeps virtual memory addresses stable)
             if engine and hasattr(engine, "sleep"):
+                t_sleep = time.monotonic()
                 logger.info("Executing engine.sleep(level=1) to release physical VRAM...")
                 await engine.sleep(level=1)
+                logger.info(
+                    "Released physical VRAM via engine.sleep(level=1) in %.2fs.",
+                    time.monotonic() - t_sleep,
+                )
             else:
                 logger.error("vLLM engine does not support sleep(level=1); physical VRAM maps were not released before snapshot.")
 
@@ -103,8 +109,13 @@ def patch_vllm_lifespan(app, snapshot_provider: Optional[GKESnapshotProvider] = 
 
             # Re-allocate physical VRAM maps
             if engine and hasattr(engine, "wake_up"):
+                t_wake = time.monotonic()
                 logger.info("Executing engine.wake_up() to restore VRAM...")
                 await engine.wake_up()
+                logger.info(
+                    "Restored physical VRAM via engine.wake_up() in %.2fs.",
+                    time.monotonic() - t_wake,
+                )
             else:
                 logger.error("vLLM engine does not support wake_up(); physical VRAM maps were not re-allocated after snapshot.")
 

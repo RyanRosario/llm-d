@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import sys
+import time
 from typing import Optional
 
 from .wrapper import patch_vllm_lifespan
@@ -22,10 +24,27 @@ try:
     logger = init_logger("vllm.snapshot.launcher")
 except ImportError:
     logger = logging.getLogger("vllm.snapshot.launcher")
+    if not logger.handlers:
+        _handler = logging.StreamHandler(sys.stdout)
+        _handler.setFormatter(
+            logging.Formatter(
+                "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)d] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logger.addHandler(_handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
 
 
 def _hook_api_server() -> bool:
     """Hooks vLLM's build_app to patch the FastAPI lifespan context."""
+    t0 = time.monotonic()
+    logger.info(
+        "Hooking vLLM HTTP server startup in pid=%d (SNAPSHOT_PROVIDER=%r)...",
+        os.getpid(),
+        os.getenv("SNAPSHOT_PROVIDER"),
+    )
     last_err: Optional[Exception] = None
     for mod_name in (
         "vllm.entrypoints.launchers.app",
@@ -58,6 +77,7 @@ def _hook_api_server() -> bool:
             and getattr(mod, "build_app", None) is _orig_build_app
         ):
             setattr(mod, "build_app", _build_app)
+    logger.info("Hooked vLLM build_app (%s) in %.2fs.", mod_name, time.monotonic() - t0)
     return True
 
 

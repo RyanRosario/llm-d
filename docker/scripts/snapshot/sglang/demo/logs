@@ -1,0 +1,107 @@
+ryanrosario@madhatter:~/Code/llm-d$ kubectl apply -f docker/scripts/snapshot/sglang/demo/sglang-snapshot.yaml
+serviceaccount/gke-pod-snapshots-nvidia-gpu-sglang-sa created
+podsnapshotstorageconfig.podsnapshot.gke.io/sglang-pod-snapshot-storage-config created
+podsnapshotpolicy.podsnapshot.gke.io/sglang-pod-snapshot-policy created
+deployment.apps/sglang-decode created
+service/sglang-service created
+ryanrosario@madhatter:~/Code/llm-d$ time kubectl rollout status deployment/sglang-decode -n ${NAMESPACE} --timeout=2400s
+Waiting for deployment "sglang-decode" rollout to finish: 0 of 1 updated replicas are available...
+
+deployment "sglang-decode" successfully rolled out
+
+real    4m36.803s
+user    0m0.380s
+sys     0m0.108s
+ryanrosario@madhatter:~/Code/llm-d$ 
+ryanrosario@madhatter:~/Code/llm-d$ POD1=$(kubectl get pods -l app=sglang-snapshot-demo -n ${NAMESPACE} --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[0].metadata.name}')
+echo "Pod 1: ${POD1}"
+
+kubectl logs ${POD1} -n ${NAMESPACE} | grep -E "Engine startup timings|sglang\.snapshot|snapshot\.providers|\[Control Plane\]"
+Pod 1: sglang-decode-8584d7496b-kwrgb
+[2026-10-01 00:33:19] INFO [sglang.snapshot.launcher:37] Hooking SGLang HTTP server startup (_wait_and_warmup) in pid=1 (SNAPSHOT_PROVIDER='gke_gvisor')...
+[2026-10-01 00:33:54] INFO [snapshot.providers:180] Configured GKESnapshotProvider (proc_path='/proc/gvisor/checkpoint', cache_dir='~/.cache/huggingface/hub').
+[2026-10-01 00:33:54] INFO [sglang.snapshot.wrapper:223] Successfully patched SGLang _wait_and_warmup for GKE snapshotting.
+[2026-10-01 00:33:54] INFO [sglang.snapshot.launcher:43] Hooked SGLang _wait_and_warmup in 35.17s.
+[2026-10-01 00:33:54] INFO [sglang.snapshot.launcher:71] Preparing SGLang server arguments from CLI args: ['--model-path', 'Qwen/Qwen3-32B', '--host', '0.0.0.0', '--port', '8000', '--tp', '1', '--enable-memory-saver', '--enable-weights-cpu-backup', '--mem-fraction-static', '0.90', '--context-length', '8192', '--enable-metrics', '--disable-custom-all-reduce']
+[2026-10-01 00:33:54] INFO [sglang.snapshot.launcher:73] Prepared SGLang server arguments in 0.03s. Launching SGLang server (pid=1, elapsed since launcher import=35.20s)...
+[2026-10-01 00:33:55] INFO [sglang.snapshot.launcher:37] Hooking SGLang HTTP server startup (_wait_and_warmup) in pid=46 (SNAPSHOT_PROVIDER='gke_gvisor')...
+[2026-10-01 00:33:55] INFO [sglang.snapshot.launcher:37] Hooking SGLang HTTP server startup (_wait_and_warmup) in pid=47 (SNAPSHOT_PROVIDER='gke_gvisor')...
+[2026-10-01 00:34:14] INFO [snapshot.providers:180] Configured GKESnapshotProvider (proc_path='/proc/gvisor/checkpoint', cache_dir='~/.cache/huggingface/hub').
+[2026-10-01 00:34:14] INFO [sglang.snapshot.wrapper:223] Successfully patched SGLang _wait_and_warmup for GKE snapshotting.
+[2026-10-01 00:34:14] INFO [sglang.snapshot.launcher:43] Hooked SGLang _wait_and_warmup in 18.37s.
+[2026-10-01 00:34:14] INFO [snapshot.providers:180] Configured GKESnapshotProvider (proc_path='/proc/gvisor/checkpoint', cache_dir='~/.cache/huggingface/hub').
+[2026-10-01 00:34:14] INFO [sglang.snapshot.wrapper:223] Successfully patched SGLang _wait_and_warmup for GKE snapshotting.
+[2026-10-01 00:34:14] INFO [sglang.snapshot.launcher:43] Hooked SGLang _wait_and_warmup in 18.37s.
+[2026-10-01 00:36:57] Engine startup timings (s): load_weight=94.35, kv_cache_allocation=0.40, scheduler_e2e=163.29, cuda_graph={prefill=54.58, decode=5.08, target_verify=0.00, draft_prefill=0.00, draft_decode=0.00, draft_extend=0.00}, tokenizer_e2e=182.58
+[2026-10-01 00:36:57] INFO [sglang.snapshot.wrapper:88] [Control Plane] Entering patched _wait_and_warmup (pid=1, provider=GKESnapshotProvider, proc_path='/proc/gvisor/checkpoint', cache_dir='~/.cache/huggingface/hub', elapsed_since_start=217.90s).
+[2026-10-01 00:36:57] INFO [sglang.snapshot.wrapper:108] [Control Plane] Checking if model weights are ready in GPUs...
+[2026-10-01 00:36:57] INFO [sglang.snapshot.wrapper:129] [Control Plane] Starting SGLang server warmup (capturing CUDA graphs & pre-allocating VRAM)...
+[2026-10-01 00:37:04] INFO [sglang.snapshot.wrapper:133] [Control Plane] Server warmup completed in 7.10s (cold-start elapsed_since_start=225.00s).
+[2026-10-01 00:37:04] INFO [sglang.snapshot.wrapper:142] [Control Plane] Freezing Python garbage collection after server warmup...
+[2026-10-01 00:37:04] INFO [sglang.snapshot.wrapper:144] [Control Plane] Froze Python garbage collection in 0.08s.
+[2026-10-01 00:37:04] INFO [sglang.snapshot.wrapper:151] [Control Plane] Set tokenizer_manager.server_status = ServerStatus.Starting (keeping /health at 503 during sleep/checkpoint).
+[2026-10-01 00:37:04] INFO [sglang.snapshot.wrapper:159] [Control Plane] Sleep signal received. Releasing GPU memory occupation for tags=['weights', 'kv_cache']...
+[2026-10-01 00:37:16] INFO [sglang.snapshot.wrapper:167] [Control Plane] Released GPU memory occupation for tags=['weights', 'kv_cache'] in 11.34s.
+[2026-10-01 00:37:16] INFO [sglang.snapshot.wrapper:174] [Control Plane] Triggering snapshot checkpoint via GKESnapshotProvider...
+[2026-10-01 00:37:16] WARNING [snapshot.providers:83] Clearing model cache without '--safetensors-load-strategy eager' detected. Ensure eager loading is enabled for safetensors models so model weights are copied to memory rather than memory-mapped from disk.
+[2026-10-01 00:37:16] INFO [snapshot.providers:89] Purging local model weight cache at '/root/.cache/huggingface/hub'...
+[2026-10-01 00:37:16] INFO [snapshot.providers:100] Clearing cache entry: /root/.cache/huggingface/hub/models--Qwen--Qwen3-32B
+[2026-10-01 00:37:16] INFO [snapshot.providers:100] Clearing cache entry: /root/.cache/huggingface/hub/CACHEDIR.TAG
+[2026-10-01 00:37:16] INFO [snapshot.providers:100] Clearing cache entry: /root/.cache/huggingface/hub/.locks
+[2026-10-01 00:37:16] INFO [snapshot.providers:100] Clearing cache entry: /root/.cache/huggingface/hub/kernels--kernels-community--sgl-flash-attn3
+[2026-10-01 00:37:16] INFO [snapshot.providers:106] Purged 4 cache entry/entries from '/root/.cache/huggingface/hub' in 0.01s.
+[2026-10-01 00:37:16] INFO [snapshot.providers:129] Opening gVisor checkpoint interface '/proc/gvisor/checkpoint' (pid=1)...
+[2026-10-01 00:37:16] INFO [snapshot.providers:139] Writing trigger byte to '/proc/gvisor/checkpoint' to initiate GKE Pod Snapshot...
+[2026-10-01 00:37:16] INFO [snapshot.providers:145] Waiting on '/proc/gvisor/checkpoint' barrier until checkpoint/restore completes...
+[2026-10-01 00:37:52] INFO [snapshot.providers:161] gVisor checkpoint completed successfully (barrier unblocked in 36.35s, status=b'r').
+[2026-10-01 00:37:52] INFO [sglang.snapshot.wrapper:177] [Control Plane] Snapshot checkpoint created / process restored from checkpoint (barrier elapsed=36.36s).
+[2026-10-01 00:37:52] INFO [sglang.snapshot.wrapper:187] [Control Plane] Wake signal received. Resuming GPU memory occupation for tags=['weights', 'kv_cache']...
+[2026-10-01 00:37:54] INFO [sglang.snapshot.wrapper:197] [Control Plane] Resumed GPU memory occupation for tags=['weights', 'kv_cache'] in 2.41s.
+[2026-10-01 00:37:54] INFO [sglang.snapshot.wrapper:206] [Control Plane] Set tokenizer_manager.server_status = ServerStatus.Up (wake-to-ready=2.41s). The server is fired up and ready to roll!
+ryanrosario@madhatter:~/Code/llm-d$ kubectl get pod ${POD1} -n ${NAMESPACE} -o custom-columns="NAME:.metadata.name,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=='PodScheduled')].lastTransitionTime,READY:.status.conditions[?(@.type=='Ready')].lastTransitionTime"
+NAME                             NODE                                                  SCHEDULED              READY
+sglang-decode-8584d7496b-kwrgb   gke-ryanrosario-snapsho-gpu-h100-pool-470deaba-63b4   2026-10-01T00:33:17Z   2026-10-01T00:37:57Z
+ryanrosario@madhatter:~/Code/llm-d$ kubectl scale deployment sglang-decode -n ${NAMESPACE} --replicas=2 && \
+  time kubectl rollout status deployment/sglang-decode -n ${NAMESPACE} --timeout=600s
+deployment.apps/sglang-decode scaled
+Waiting for deployment "sglang-decode" rollout to finish: 1 of 2 updated replicas are available...
+deployment "sglang-decode" successfully rolled out
+
+real    0m18.655s
+user    0m0.267s
+sys     0m0.102s
+ryanrosario@madhatter:~/Code/llm-d$ POD2=$(kubectl get pods -l app=sglang-snapshot-demo -n ${NAMESPACE} --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
+echo "Pod 2 (Restored): ${POD2}"
+
+kubectl get pod ${POD2} -n ${NAMESPACE} -o custom-columns="NAME:.metadata.name,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=='PodScheduled')].lastTransitionTime,STARTED:.status.containerStatuses[0].state.running.startedAt,RESTORED:.status.conditions[?(@.type=='PodRestored')].lastTransitionTime,READY:.status.conditions[?(@.type=='Ready')].lastTransitionTime"
+Pod 2 (Restored): sglang-decode-8584d7496b-9w79j
+NAME                             NODE                                                  SCHEDULED              STARTED                RESTORED               READY
+sglang-decode-8584d7496b-9w79j   gke-ryanrosario-snapsho-gpu-h100-pool-470deaba-9847   2026-10-01T00:39:27Z   2026-10-01T00:39:34Z   2026-10-01T00:39:41Z   2026-10-01T00:39:46Z
+ryanrosario@madhatter:~/Code/llm-d$ kubectl get events -n ${NAMESPACE} --field-selector reason=GKEPodSnapshotting --sort-by=.lastTimestamp
+LAST SEEN   TYPE     REASON               OBJECT                               MESSAGE
+2m7s        Normal   GKEPodSnapshotting   pod/sglang-decode-8584d7496b-kwrgb   Successfully checkpointed the pod to PodSnapshot llm-d-gke-pod-snapshots/aa7a7f61-e3a7-4fb1-900f-36b2bbb6e991
+18s         Normal   GKEPodSnapshotting   pod/sglang-decode-8584d7496b-9w79j   Successfully restored the pod from PodSnapshot llm-d-gke-pod-snapshots/aa7a7f61-e3a7-4fb1-900f-36b2bbb6e991
+ryanrosario@madhatter:~/Code/llm-d$ kubectl logs ${POD2} -n ${NAMESPACE} | grep -E "sglang\.snapshot|snapshot\.providers|\[Control Plane\]"
+[2026-10-01 00:39:41] INFO [snapshot.providers:161] gVisor checkpoint completed successfully (barrier unblocked in 145.12s, status=b'r').
+[2026-10-01 00:39:41] INFO [sglang.snapshot.wrapper:177] [Control Plane] Snapshot checkpoint created / process restored from checkpoint (barrier elapsed=145.13s).
+[2026-10-01 00:39:41] INFO [sglang.snapshot.wrapper:187] [Control Plane] Wake signal received. Resuming GPU memory occupation for tags=['weights', 'kv_cache']...
+[2026-10-01 00:39:43] INFO [sglang.snapshot.wrapper:197] [Control Plane] Resumed GPU memory occupation for tags=['weights', 'kv_cache'] in 2.42s.
+[2026-10-01 00:39:43] INFO [sglang.snapshot.wrapper:206] [Control Plane] Set tokenizer_manager.server_status = ServerStatus.Up (wake-to-ready=2.42s). The server is fired up and ready to roll!
+ryanrosario@madhatter:~/Code/llm-d$ POD2_IP=$(kubectl get pod ${POD2} -n ${NAMESPACE} -o jsonpath='{.status.podIP}')
+
+time kubectl run curl-test --rm -i --restart=Never \
+  --image=cfmanteiga/alpine-bash-curl-jq:latest \
+  -n ${NAMESPACE} \
+  -- curl -sS -w "\nHTTP_ROUND_TRIP_SECONDS: %{time_total}s\n" \
+    -X POST "http://${POD2_IP}:8000/v1/completions" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\": \"${MODEL}\", \"prompt\": \"Explain Kubernetes pod snapshots in two sentences:\", \"max_tokens\": 64}"
+All commands and output from this session will be recorded in container logs, including credentials and sensitive information passed through the command prompt.
+If you don't see a command prompt, try pressing enter.
+{"id":"e789112d4591483ea0f8eb8c4660612c","object":"text_completion","created":1790815226,"model":"Qwen/Qwen3-32B","choices":[{"index":0,"text":" one that describes what they are and one that outlines why they're useful. Kubernetes pod snapshots are lightweight, point-in-time copies of a pod's state and configuration, capturing its current runtime data. They enable quick recovery from failures, support consistent backups, and facilitate testing by allowing pods to be reverted to a known good state","logprobs":null,"finish_reason":"length","matched_stop":null}],"usage":{"prompt_tokens":9,"total_tokens":73,"completion_tokens":64,"prompt_tokens_details":null,"reasoning_tokens":0},"metadata":{"weight_version":"default","weight_versions":[{"version":"default","start":0,"end":64}]}}
+HTTP_ROUND_TRIP_SECONDS: 4296.792218s
+pod "curl-test" deleted from llm-d-gke-pod-snapshots namespace
+
+real    0m11.936s
+user    0m0.267s
+sys     0m0.106s

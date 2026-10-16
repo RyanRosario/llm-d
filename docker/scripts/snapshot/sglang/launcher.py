@@ -21,12 +21,26 @@ import functools
 import logging
 import os
 import sys
+import time
 from typing import Any, Optional
 
 from ..providers import GKESnapshotProvider, get_snapshot_provider
 from .wrapper import sglang_snapshot_callback, sglang_warmup_and_hold
 
+LAUNCHER_START_TIME = time.monotonic()
+
 logger = logging.getLogger("sglang.snapshot.launcher")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(
+        logging.Formatter(
+            "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)d] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 def _get_snapshot_provider_for_launch(server_args) -> Optional[GKESnapshotProvider]:
@@ -79,7 +93,40 @@ def _get_snapshot_provider_for_launch(server_args) -> Optional[GKESnapshotProvid
     return snapshot_provider
 
 
+def _preload_sglang() -> bool:
+    """Preloads SGLang HTTP server at module import time so both main and spawned worker processes log import timings."""
+    import importlib.util
+
+    try:
+        if importlib.util.find_spec("sglang") is None:
+            return False
+    except (ImportError, ValueError):
+        return False
+    t0 = time.monotonic()
+    logger.info(
+        "Hooking SGLang HTTP server startup (_wait_and_warmup) in pid=%d (SNAPSHOT_PROVIDER=%r)...",
+        os.getpid(),
+        os.getenv("SNAPSHOT_PROVIDER"),
+    )
+    try:
+        import sglang.srt.entrypoints.http_server  # noqa: F401  # pyright: ignore[reportMissingImports]
+    except Exception:
+        return False
+    logger.info("Hooked SGLang _wait_and_warmup in %.2fs.", time.monotonic() - t0)
+    return True
+
+
+_PRELOADED = _preload_sglang()
+
+
 def main() -> None:
+    t0 = time.monotonic()
+    if not _PRELOADED:
+        logger.info(
+            "Hooking SGLang HTTP server startup (_wait_and_warmup) in pid=%d (SNAPSHOT_PROVIDER=%r)...",
+            os.getpid(),
+            os.getenv("SNAPSHOT_PROVIDER"),
+        )
     try:
         from sglang.launch_server import run_server  # pyright: ignore[reportMissingImports,reportUnknownVariableType]
         from sglang.srt.entrypoints.http_server import (  # pyright: ignore[reportMissingImports,reportUnknownVariableType]
@@ -94,6 +141,8 @@ def main() -> None:
             "sglang must be installed to run snapshot launcher (python3 -m docker.scripts.snapshot.sglang.launcher)"
         ) from err
 
+    if not _PRELOADED:
+        logger.info("Hooked SGLang _wait_and_warmup in %.2fs.", time.monotonic() - t0)
     load_plugins()
     server_args = prepare_server_args(sys.argv[1:])
     snapshot_provider = _get_snapshot_provider_for_launch(server_args)

@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import sys
 import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -20,7 +21,20 @@ import requests
 
 from ..providers import GKESnapshotProvider
 
+WRAPPER_IMPORT_TIME = time.monotonic()
+
 logger = logging.getLogger("sglang.snapshot.wrapper")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(
+        logging.Formatter(
+            "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)d] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 def _wait_for_server(server_url: str, attempts: int = 120) -> None:
@@ -75,6 +89,12 @@ def sglang_snapshot_callback(
     # post-warmup status. With --skip-server-warmup, SGLang sets Up right before calling
     # launch_callback, leaving a brief window before this reset where /health can see Up.
     prev_status = held_status.get("status", tokenizer_manager.server_status)
+    warmup_done_mono = held_status.get("warmup_done_mono")
+    if isinstance(warmup_done_mono, (int, float)):
+        logger.info(
+            "[Control Plane] Froze Python garbage collection in %.2fs.",
+            max(0.0, time.monotonic() - warmup_done_mono),
+        )
     tokenizer_manager.server_status = http_server.ServerStatus.Starting
     ssl_verify = _get_ssl_verify(server_args)
 
@@ -96,17 +116,31 @@ def sglang_snapshot_callback(
             resp.raise_for_status()
 
         # With --skip-server-warmup, nothing has waited for the server to start listening yet.
+        t_wait = time.monotonic()
         _wait_for_server(server_url)
+        logger.info(
+            "[Control Plane] The SGLang scheduler is idle (waited %.2fs).",
+            time.monotonic() - t_wait,
+        )
 
         # STEP 1: Release GPU memory occupation (KV cache), move weights, save addresses
+        t_sleep = time.monotonic()
         logger.info("Executing POST /release_memory_occupation to release physical VRAM...")
         post("/release_memory_occupation")
+        logger.info(
+            "Released GPU memory occupation for tags=['weights', 'kv_cache'] in %.2fs.",
+            time.monotonic() - t_sleep,
+        )
 
         # STEP 2: Trigger the snapshot / checkpoint
+        t_trigger = time.monotonic()
         try:
             logger.info("Triggering snapshot checkpoint...")
             snapshot_provider.trigger()
-            logger.info("Snapshot checkpoint created successfully.")
+            logger.info(
+                "Snapshot checkpoint created successfully (barrier elapsed=%.2fs).",
+                time.monotonic() - t_trigger,
+            )
         except Exception as e:
             # We continue without snapshotting but this can still leave us
             # in an inconsistent state. Ex: trigger may clear the weights
@@ -118,13 +152,23 @@ def sglang_snapshot_callback(
             )
         finally:
             # STEP 3: Regardless of success or failure, resume GPU memory occupation, restore addresses, move weights, allocate VRAM
+            t_wake = time.monotonic()
             logger.info("Executing POST /resume_memory_occupation to restore VRAM...")
             post("/resume_memory_occupation")
+            wake_elapsed = time.monotonic() - t_wake
+            logger.info(
+                "Resumed GPU memory occupation for tags=['weights', 'kv_cache'] in %.2fs.",
+                wake_elapsed,
+            )
             logger.info("SGLang memory occupation resumed successfully.")
 
         # STEP 4: Restore the saved server status only after memory occupation has been restored
         tokenizer_manager.server_status = prev_status
-        logger.info("Restored server_status to %s.", prev_status)
+        logger.info(
+            "Restored server_status to %s (wake-to-ready=%.2fs).",
+            prev_status,
+            time.monotonic() - t_wake,
+        )
     except Exception as e:
         logger.error("Sleep/wake cycle failed: %s. Terminating SGLang server.", e, exc_info=True)
         kill_process_tree(os.getpid())
@@ -143,8 +187,13 @@ def sglang_warmup_and_hold(
     status in held_status and set Starting again, so readiness probes keep failing until
     sglang_snapshot_callback has finished the cycle and restored it.
     """
+    t_warmup = time.monotonic()
+    logger.info(
+        "[Control Plane] Starting SGLang server warmup (capturing CUDA graphs & pre-allocating VRAM)..."
+    )
     # Run upstream native warmup procedure.
     if not execute_warmup_func(server_args):
+        logger.error("[Control Plane] Server warmup failed; aborting before snapshot checkpoint.")
         return False
 
     from sglang.srt.entrypoints import http_server  # pyright: ignore[reportMissingImports,reportUnknownVariableType]
@@ -152,5 +201,11 @@ def sglang_warmup_and_hold(
     tokenizer_manager: Any = http_server._global_state.tokenizer_manager  # pyright: ignore[reportOptionalMemberAccess]
     held_status["status"] = tokenizer_manager.server_status
     tokenizer_manager.server_status = http_server.ServerStatus.Starting
+    logger.info(
+        "[Control Plane] Server warmup completed in %.2fs (cold-start elapsed_since_start=%.2fs).",
+        time.monotonic() - t_warmup,
+        time.monotonic() - WRAPPER_IMPORT_TIME,
+    )
     logger.info("Holding server_status at Starting until the snapshot completes.")
+    held_status["warmup_done_mono"] = time.monotonic()
     return True
