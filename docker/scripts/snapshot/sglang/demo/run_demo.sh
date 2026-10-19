@@ -42,6 +42,7 @@
 # the other settings below `set -euo pipefail` have defaults)
 # - ENGINE: Engine(s) to run: `both` (default), `vllm`, or `sglang`.
 # - MODEL_SERVER: Alias for ENGINE (`both`, `vllm`, or `sglang`).
+# - CSV_FILE: Path to write CSV metrics (default: `docker/scripts/snapshot/sglang/demo/results.csv`).
 # - HF_TOKEN: Hugging Face token for the llm-d-hf-token secret (setup; not needed if it exists).
 # - STOP_AFTER_SNAPSHOT: 1 stops `all` right after the PodSnapshot reaches AllSnapshotsAvailable.
 # - FROM_RESTORE: 1 starts `all` from the restore phase (same as `--from-restore` or `restore`).
@@ -100,7 +101,8 @@ REUSE_SNAPSHOT="${REUSE_SNAPSHOT:-0}"
 STOP_AFTER_SNAPSHOT="${STOP_AFTER_SNAPSHOT:-0}"
 FROM_RESTORE="${FROM_RESTORE:-0}"
 ENGINE="${ENGINE:-${MODEL_SERVER:-both}}"
-USAGE_STR="Usage: $0 [--engine vllm|sglang|both] [--vllm|--sglang|--both] [--stop-after-snapshot|--until-snapshot|-s] [--from-restore|-r] [preflight|provision|setup|reset|deploy|restore|scale|verify|report|cleanup|all]"
+CSV_FILE="${CSV_FILE:-${REPO_ROOT}/docker/scripts/snapshot/sglang/demo/results.csv}"
+USAGE_STR="Usage: $0 [--engine vllm|sglang|both] [--vllm|--sglang|--both] [--csv <path>] [--stop-after-snapshot|--until-snapshot|-s] [--from-restore|-r] [preflight|provision|setup|reset|deploy|restore|scale|verify|report|cleanup|all]"
 ACTION=""
 while (( $# > 0 )); do
   case "$1" in
@@ -127,6 +129,19 @@ while (( $# > 0 )); do
       ;;
     --both)
       ENGINE="both"
+      shift
+      ;;
+    --csv)
+      if (( $# < 2 )); then
+        echo "ERROR: $1 requires a file path argument." >&2
+        echo "${USAGE_STR}" >&2
+        exit 1
+      fi
+      CSV_FILE="$2"
+      shift 2
+      ;;
+    --csv=*)
+      CSV_FILE="${1#*=}"
       shift
       ;;
     -s|--stop-after-snapshot|--until-snapshot)
@@ -328,6 +343,9 @@ wait_for_rollout() {
 # Pod 2 (restore), the wall-clock time of each step of this run, and the test request latencies.
 print_timing_table() {
   local args=(report --namespace "${NAMESPACE}" --selector "${POD_SELECTOR}" --engine "${CURRENT_ENGINE}" --cold-cache "${COLD_CACHE_FILE}") entry
+  if [[ -n "${CSV_FILE:-}" ]]; then
+    args+=(--csv "${CSV_FILE}")
+  fi
   for entry in ${STEP_TIMES[@]+"${STEP_TIMES[@]}"}; do
     args+=(--step "${entry}")
   done
@@ -1073,12 +1091,20 @@ step_verify() {
   echo "Sending test completion requests to both ${ENGINE_DISPLAY} Pod 1 and Pod 2..."
 
   # Runs in the test pod. The model, engine label, and pod IPs are positional parameters, never script text.
+  # Streams /v1/completions (stream: true) to measure TTFT and ITL/TPOT alongside total request latency.
   # Fails if a request fails or a reply has no completion text.
   script="$(cat <<'SH'
 model="$1"
 engine_label="$2"
 shift 2
 rc=0
+now_s() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    printf '%s\n' "$EPOCHREALTIME"
+  else
+    cut -d' ' -f1 /proc/uptime
+  fi
+}
 while [ "$#" -ge 2 ]; do
   name="$1"
   ip="$2"
@@ -1088,43 +1114,100 @@ while [ "$#" -ge 2 ]; do
     *) url="http://$ip:8000/v1/completions" ;;
   esac
   body=$(jq -cn --arg model "$model" --arg eng "$engine_label" \
-    '{model: $model, prompt: ("Pod snapshots on GKE allow " + $eng + " to"), max_tokens: 32, temperature: 0}')
+    '{model: $model, prompt: ("Pod snapshots on GKE allow " + $eng + " to"), max_tokens: 32, temperature: 0, stream: true}')
   echo ""
   echo "=== $name ($ip:8000) ==="
-  echo "\$ curl -fsS --max-time 300 -H 'Content-Type: application/json' -d '$body' $url"
-  # Timed with /proc/uptime: the time_total of this image's curl (7.55.0) is often 2^32 us too high.
-  t0=$(cut -d' ' -f1 /proc/uptime)
-  if ! out=$(curl -fsS --max-time 300 -H 'Content-Type: application/json' -d "$body" "$url"); then
+  echo "\$ curl -N -fsS --max-time 300 -H 'Content-Type: application/json' -d '$body' $url"
+  chunks=$(mktemp)
+  times=$(mktemp)
+  raw=$(mktemp)
+  curl_rc_file=$(mktemp)
+  rm -f "$curl_rc_file"
+  # Timed with $EPOCHREALTIME (bash) or /proc/uptime: the time_total of this image's curl (7.55.0) is often 2^32 us too high.
+  t0=$(now_s)
+  {
+    curl -N -fsS --max-time 300 -H 'Content-Type: application/json' -d "$body" "$url" || echo $? >"$curl_rc_file"
+  } | {
+    exec 4>"$chunks" 5>"$times" 6>"$raw"
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line%$(printf '\r')}"
+      case "$line" in
+        "data: [DONE]"*) ;;
+        "data: {"*)
+          case "$line" in
+            *'"text":""'*|*'"text": ""'*) ;;
+            *)
+              if [ -n "${EPOCHREALTIME:-}" ]; then
+                t_now="$EPOCHREALTIME"
+              else
+                read -r t_now _ </proc/uptime
+              fi
+              printf '%s\n' "$t_now" >&5
+              ;;
+          esac
+          printf '%s\n' "${line#data: }" >&4
+          ;;
+        ?*)
+          printf '%s\n' "$line" >&6
+          ;;
+      esac
+    done
+  }
+  t1=$(now_s)
+  if [ -f "$curl_rc_file" ]; then
     echo "FAILED: the completion request to $name failed." >&2
+    rm -f "$chunks" "$times" "$raw" "$curl_rc_file"
     rc=1
     continue
   fi
-  t1=$(cut -d' ' -f1 /proc/uptime)
-  secs=$(awk -v t0="$t0" -v t1="$t1" 'BEGIN { printf "%.2f", t1 - t0 }')
+  if [ -s "$chunks" ]; then
+    out=$(jq -s 'if length == 0 then empty else .[0] * {choices: [{text: (map(.choices[0].text // "") | join("")), index: 0, logprobs: null, finish_reason: .[-1].choices[0].finish_reason}]} end' "$chunks")
+  else
+    out=$(cat "$raw")
+  fi
+  eval "$(awk -v t0="$t0" -v t1="$t1" '
+    { ts[++n] = $1 + 0 }
+    END {
+      total = t1 - t0
+      ttft = (n >= 1) ? (ts[1] - t0) : total
+      tpot = (n >= 2) ? ((ts[n] - ts[1]) / (n - 1)) : 0
+      printf "secs=%.2f ttft=%.4f tpot=%.4f\n", total, ttft, tpot
+    }
+  ' "$times")"
+  rm -f "$chunks" "$times" "$raw" "$curl_rc_file"
   printf '%s\n' "$out" | jq .
-  if ! printf '%s\n' "$out" | jq -e '.choices[0].text | type == "string"' >/dev/null; then
+  if ! printf '%s\n' "$out" | jq -e '.choices[0].text | type == "string" and length > 0' >/dev/null; then
     echo "FAILED: $name returned no completion text." >&2
     rc=1
     continue
   fi
-  echo "Request to $name completed in ${secs}s"
+  echo "Request to $name completed in ${secs}s (TTFT: ${ttft}s, ITL/TPOT: ${tpot}s)"
 done
 exit "$rc"
 SH
 )"
-  show_line "kubectl run curl-test -n ${NAMESPACE} --rm -i --restart=Never --image=${CURL_TEST_IMAGE} -- /bin/sh -c '<for each pod: curl /v1/completions and check the reply>' sh ${MODEL} ${ENGINE_DISPLAY} 'Pod 1' ${pod1_ip} 'Pod 2' ${pod2_ip}"
+  show_line "kubectl run curl-test -n ${NAMESPACE} --rm -i --restart=Never --image=${CURL_TEST_IMAGE} -- /bin/bash -c '<for each pod: stream /v1/completions and measure TTFT + ITL/TPOT>' bash ${MODEL} ${ENGINE_DISPLAY} 'Pod 1' ${pod1_ip} 'Pod 2' ${pod2_ip}"
   out="$(mktemp)"
+  local completed_pods=0
   kubectl run curl-test -n "${NAMESPACE}" --rm -i --restart=Never \
     --image="${CURL_TEST_IMAGE}" \
-    -- /bin/sh -c "${script}" sh "${MODEL}" "${ENGINE_DISPLAY}" "Pod 1" "${pod1_ip}" "Pod 2" "${pod2_ip}" | tee "${out}" || rc=$?
+    -- /bin/bash -c "${script}" bash "${MODEL}" "${ENGINE_DISPLAY}" "Pod 1" "${pod1_ip}" "Pod 2" "${pod2_ip}" | tee "${out}" || rc=$?
   while IFS= read -r line; do
-    if [[ "${line}" =~ ^Request\ to\ (Pod\ [12])\ completed\ in\ ([0-9.]+)s$ ]]; then
+    if [[ "${line}" =~ ^Request\ to\ (Pod\ [12])\ completed\ in\ ([0-9.]+)s\ \(TTFT:\ ([0-9.]+)s,\ ITL/TPOT:\ ([0-9.]+)s\)$ ]]; then
+      VERIFY_LATENCIES+=(
+        "${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"
+        "${BASH_REMATCH[1]} TTFT=${BASH_REMATCH[3]}"
+        "${BASH_REMATCH[1]} ITL/TPOT=${BASH_REMATCH[4]}"
+      )
+      completed_pods=$(( completed_pods + 1 ))
+    elif [[ "${line}" =~ ^Request\ to\ (Pod\ [12])\ completed\ in\ ([0-9.]+)s$ ]]; then
       VERIFY_LATENCIES+=("${BASH_REMATCH[1]}=${BASH_REMATCH[2]}")
+      completed_pods=$(( completed_pods + 1 ))
     fi
   done <"${out}"
   rm -f "${out}"
   (( rc == 0 )) || die "the test requests failed (kubectl run exited with code ${rc})"
-  (( ${#VERIFY_LATENCIES[@]} == 2 )) || die "expected a completion from both Pod 1 and Pod 2"
+  (( completed_pods == 2 )) || die "expected a completion from both Pod 1 and Pod 2"
 
   record_step "Verify (${ENGINE_DISPLAY}): test pod, 2 completion requests" "${t_start}"
   echo ">>> Step 4 (verify ${ENGINE_DISPLAY}) finished in $(( SECONDS - t_start ))s (including test pod scheduling)."

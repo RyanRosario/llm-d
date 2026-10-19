@@ -23,7 +23,9 @@ The helper only reads from the cluster: it runs kubectl get, kubectl logs and ku
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
+import io
 import json
 import os
 import pathlib
@@ -431,7 +433,9 @@ def log_milestones(log_text, attempt=0, engine=""):
         elif VLLM_PATCHED_RE.search(text):
             values["engine"] = "vllm"
             cold = True
-            values.setdefault("hook_ts", ts)
+            values["patched_ts"] = ts
+            if "workers_ts" not in values and "weights_begin_ts" not in values:
+                values.setdefault("hook_ts", ts)
             add(ts, "patched", P1_VLLM, "Patched vLLM FastAPI lifespan context for GKE snapshotting")
         elif m := VLLM_ENGINECORE_RE.search(text):
             values["engine"] = "vllm"
@@ -898,10 +902,15 @@ def cmd_watch(args):
         )
         if items:
             events = (kubectl.json("get", "events", "--field-selector", "involvedObject.kind=Pod") or {}).get("items", [])
-            p1 = pod_times(kubectl, items[0], events, engine=args.engine or "")
-            if not is_restored(p1):
-                snaps = (kubectl.json("get", "podsnapshots") or {}).get("items", [])
-                save_cold_cache(args.cold_cache, p1, snapshot_ready(snaps))
+            p_first = pod_times(kubectl, items[0], events, engine=args.engine or "")
+            p_last = pod_times(kubectl, items[-1], events, engine=args.engine or "") if len(items) >= 2 else None
+            snaps = (kubectl.json("get", "podsnapshots") or {}).get("items", [])
+            save_cold_cache(
+                args.cold_cache,
+                p_first if not is_restored(p_first) else None,
+                snapshot_ready(snaps),
+                p_last if (p_last and is_restored(p_last)) else (p_first if is_restored(p_first) else None),
+            )
     return 0
 
 
@@ -960,11 +969,35 @@ def _decode_dt(obj: object) -> object:
     return obj
 
 
-def save_cold_cache(path, pod_dict, snap_ready_ts):
-    if not path or not pod_dict:
+def _decode_pod_dict(raw_pod):
+    pod = _decode_dt(raw_pod)
+    if not isinstance(pod, dict):
+        return None
+    log_data = pod.get("log")
+    if isinstance(log_data, dict) and isinstance(log_data.get("graphs"), list):
+        log_data["graphs"] = [tuple(g) for g in log_data["graphs"]]
+    return pod
+
+
+def save_cold_cache(
+    path,
+    pod_dict=None,
+    snap_ready_ts=None,
+    restore_pod_dict=None,
+    steps=None,
+    latencies=None,
+):
+    if not path or (not pod_dict and not restore_pod_dict and not steps and not latencies):
         return
     try:
-        payload = {"pod": _encode_dt_tree(pod_dict), "snap_ready": _encode_dt(snap_ready_ts)}
+        existing_p1, existing_snap, existing_p2, existing_steps, existing_lats = load_cold_cache(path)
+        payload = {
+            "pod": _encode_dt_tree(pod_dict or existing_p1),
+            "snap_ready": _encode_dt(snap_ready_ts or existing_snap),
+            "restore_pod": _encode_dt_tree(restore_pod_dict or existing_p2),
+            "steps": list(steps) if steps else (existing_steps or []),
+            "latencies": list(latencies) if latencies else (existing_lats or []),
+        }
         pathlib.Path(path).write_text(json.dumps(payload), encoding="utf-8")
     except OSError:
         pass
@@ -982,19 +1015,17 @@ def _encode_dt_tree(obj):
 
 def load_cold_cache(path):
     if not path:
-        return None, None
+        return None, None, None, [], []
     try:
         raw = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
-        pod = _decode_dt(raw.get("pod"))
-        if not isinstance(pod, dict):
-            return None, None
-        log_data = pod.get("log")
-        if isinstance(log_data, dict) and isinstance(log_data.get("graphs"), list):
-            log_data["graphs"] = [tuple(g) for g in log_data["graphs"]]
+        pod = _decode_pod_dict(raw.get("pod"))
+        restore_pod = _decode_pod_dict(raw.get("restore_pod"))
         snap_dt = _decode_dt(raw.get("snap_ready"))
-        return pod, (snap_dt if isinstance(snap_dt, dt.datetime) else None)
-    except (OSError, ValueError, KeyError):
-        return None, None
+        steps = [(str(k), float(v)) for k, v in (raw.get("steps") or [])]
+        latencies = [(str(k), float(v)) for k, v in (raw.get("latencies") or [])]
+        return pod, (snap_dt if isinstance(snap_dt, dt.datetime) else None), restore_pod, steps, latencies
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, None, None, [], []
 
 
 def parse_pairs(pairs):
@@ -1008,6 +1039,19 @@ def parse_pairs(pairs):
         if not sep or not label:
             raise SystemExit(f"ERROR: expected LABEL=SECONDS, got {pair!r}")
     return result
+
+
+def _merge_cached_pod(live, cached):
+    """Preserves event-derived fields (pull, pulling_ts, pulled_ts) when K8s events expire after 1h."""
+    if not live:
+        return cached
+    if not cached or live.get("name") != cached.get("name"):
+        return live
+    merged = dict(live)
+    for k in ("pull", "pulling_ts", "pulled_ts"):
+        if merged.get(k) is None and cached.get(k) is not None:
+            merged[k] = cached[k]
+    return merged
 
 
 def cmd_report(args):
@@ -1025,32 +1069,43 @@ def cmd_report(args):
     )
     events = (kubectl.json("get", "events", "--field-selector", "involvedObject.kind=Pod") or {}).get("items", [])
     snaps = (kubectl.json("get", "podsnapshots") or {}).get("items", [])
-    snap_ts = snapshot_ready(snaps)
     p1 = pod_times(kubectl, items[0], events, engine=eng) if items else None
     p2 = pod_times(kubectl, items[-1], events, engine=eng) if len(items) >= 2 else None
 
-    if p1 and not is_restored(p1):
-        save_cold_cache(args.cold_cache, p1, snap_ts)
-    elif args.cold_cache:
-        cached_p1, cached_snap = load_cold_cache(args.cold_cache)
-        if cached_p1:
-            if p1 and is_restored(p1):
-                # The cluster only has restored pod(s) because the cold-start pod was scaled down earlier.
-                p2 = p2 or p1
-                p1 = cached_p1
-            elif p1 is None:
-                p1 = cached_p1
-            if snap_ts is None:
-                snap_ts = cached_snap
+    if args.cold_cache:
+        cached_p1, cached_snap, cached_p2, cached_steps, cached_lats = load_cold_cache(args.cold_cache)
+        if p1 and is_restored(p1):
+            p2 = _merge_cached_pod(p2 or p1, cached_p2)
+            p1 = cached_p1
+        else:
+            p1 = _merge_cached_pod(p1, cached_p1)
+            p2 = _merge_cached_pod(p2, cached_p2)
+        snap_ts = snapshot_ready(snaps, pod=p1) or cached_snap
+        if not steps and cached_steps:
+            steps = cached_steps
+        if not latencies and cached_lats:
+            latencies = cached_lats
+        if (p1 and not is_restored(p1)) or (p2 and is_restored(p2)) or steps or latencies:
+            save_cold_cache(
+                args.cold_cache,
+                p1 if (p1 and not is_restored(p1)) else None,
+                snap_ts,
+                p2 if (p2 and is_restored(p2)) else None,
+                steps=steps,
+                latencies=latencies,
+            )
+    else:
+        snap_ts = snapshot_ready(snaps, pod=p1)
 
     if not eng:
         active_pod = p1 or p2
         eng = str(active_pod.get("engine", "")) if isinstance(active_pod, dict) else ""
-    print_report(p1, p2, snap_ts, steps, latencies, engine=eng)
+    csv_path = getattr(args, "csv", "") or os.environ.get("CSV_FILE", "")
+    print_report(p1, p2, snap_ts, steps, latencies, engine=eng, csv_path=csv_path)
     return 0
 
 
-def snapshot_ready(snaps):
+def snapshot_ready(snaps, pod=None):
     ready = []
     for snap in snaps:
         for c in snap.get("status", {}).get("conditions", []):
@@ -1058,7 +1113,15 @@ def snapshot_ready(snaps):
                 ts = parse_ts(c.get("lastTransitionTime"))
                 if ts:
                     ready.append(ts)
-    return max(ready) if ready else None
+    if not ready:
+        return None
+    if pod and pod.get("created") and pod.get("ready"):
+        in_window = [
+            ts for ts in ready
+            if pod["created"] <= ts <= pod["ready"] + dt.timedelta(seconds=30)
+        ]
+        return max(in_window) if in_window else None
+    return max(ready)
 
 
 # Layout of the timing table: a label column and two value columns.
@@ -1099,89 +1162,401 @@ def kind_text(pod):
     return "cold start"
 
 
-def pod_steps(pod):
-    """The steps from pod creation to Ready, as (label, points); each point ends one sub-step."""
+def compute_k8s_metrics(pod):
+    """Computes contiguous Kubernetes sub-step timestamps and durations (1, 1a..1d)."""
+    t0 = pod["created"]
+    t_1a = max(t0, pod.get("scheduled") or t0)
+    t_1b = max(t_1a, pod.get("sandbox") or pod.get("pulling_ts") or t_1a)
+    t_1c = max(t_1b, pod.get("pulled_ts") or t_1b)
+    t_1d = max(t_1c, pod.get("started") or t_1c)
+    return t_1d, {
+        "1": (t_1d - t0).total_seconds(),
+        "1a": (t_1a - t0).total_seconds(),
+        "1b": (t_1b - t_1a).total_seconds(),
+        "1c": (t_1c - t_1b).total_seconds(),
+        "1d": (t_1d - t_1c).total_seconds(),
+        "t_1a": t_1a,
+        "t_1b": t_1b,
+        "t_1c": t_1c,
+        "t_1d": t_1d,
+    }
+
+
+def compute_cold_metrics(pod):
+    """Computes contiguous ColdStart metrics (1, 1a..1d, 2, 2a..2g, 3, 4, 4a..4f) for Pod 1."""
+    t_1d, k8s = compute_k8s_metrics(pod)
     log = pod["log"]
-    eng = pod.get("engine") or log.get("engine") or "sglang"
-    if pod["pull"] == "already on the node":
-        pull = "The image is already on the node"
-    else:
-        pull = "Pull the image" + (" (image streaming)" if pod["streaming"] else "")
-    start = "Start the container" + (f" (restarts: {pod['restarts']})" if pod["restarts"] else "")
+    weights_begin = log.get("weights_begin_ts")
+    launcher = log.get("launcher_ts")
+    if weights_begin and launcher and launcher > weights_begin:
+        launcher = None
+    hook = log.get("hook_ts")
+    if weights_begin and hook and hook > weights_begin:
+        hook = None
+    if launcher is None and hook is not None and log.get("hook_s") is not None:
+        launcher = max(t_1d, hook - dt.timedelta(seconds=float(log["hook_s"])))
+
+    t_end_2 = (
+        log.get("sleep_start_ts")
+        or log.get("warmup_done_ts")
+        or log.get("gc_ts")
+        or log.get("idle_ts")
+        or log.get("release_req_ts")
+        or log.get("released_ts")
+        or t_1d
+    )
+    t_2a = max(t_1d, launcher or t_1d)
+    t_2b = max(t_2a, hook or t_2a)
+    t_2c = max(t_2b, weights_begin or log.get("workers_ts") or t_2b)
+    t_2d = max(t_2c, log.get("weights_end_ts") or t_2c)
+    t_2e = max(t_2d, log.get("kv_ts") or t_2d)
+    t_2f = max(t_2e, log.get("graph_end_ts") or log.get("compile_ts") or t_2e)
+    t_2g = max(t_2f, t_end_2)
+
+    t_4a = max(t_2g, log.get("gc_ts") or t_2g)
+    t_4b = max(t_4a, log.get("idle_ts") or t_4a)
+    t_4c = max(t_4b, log.get("released_ts") or t_4b)
+    t_4d = max(t_4c, log.get("purged_ts") or t_4c)
+    t_4e = max(t_4d, log.get("checkpoint_ts") or t_4d)
     up = log.get("up_ts") or log.get("resumed_ts")
-    steps = [("Kubernetes: schedule the pod and start the container", [
-        Point("Wait for a GPU node", pod["scheduled"], False),
-        Point("Set up the pod sandbox" + (f" ({pod['runtime']})" if pod["runtime"] else ""),
-              pod["sandbox"] or pod["pulling_ts"], False),
-        Point(pull, pod["pulled_ts"], False),
-        Point(start, pod["started"], False),
-    ])]
-    if is_restored(pod):
-        restored = log.get("restore_ts")
-        resume_label = (
-            "Resume GPU memory (engine.wake_up())"
-            if eng == "vllm"
-            else "Resume GPU memory (weights + KV cache)"
+    t_4f = max(t_4e, up or t_4e)
+    t_ready = max(t_4f, pod.get("ready") or t_4f)
+
+    m = dict(k8s)
+    m.update({
+        "2": (t_2g - t_1d).total_seconds(),
+        "2a": (t_2a - t_1d).total_seconds(),
+        "2b": (t_2b - t_2a).total_seconds(),
+        "2c": (t_2c - t_2b).total_seconds(),
+        "2d": (t_2d - t_2c).total_seconds(),
+        "2e": (t_2e - t_2d).total_seconds(),
+        "2f": (t_2f - t_2e).total_seconds(),
+        "2g": (t_2g - t_2f).total_seconds(),
+        "3": (t_ready - t_4f).total_seconds(),
+        "4": (t_4f - t_2g).total_seconds(),
+        "4a": (t_4a - t_2g).total_seconds(),
+        "4b": (t_4b - t_4a).total_seconds(),
+        "4c": (t_4c - t_4b).total_seconds(),
+        "4d": (t_4d - t_4c).total_seconds(),
+        "4e": (t_4e - t_4d).total_seconds(),
+        "4f": (t_4f - t_4e).total_seconds(),
+        "t_2a": t_2a,
+        "t_2b": t_2b,
+        "t_2c": t_2c,
+        "t_2d": t_2d,
+        "t_2e": t_2e,
+        "t_2f": t_2f,
+        "t_2g": t_2g,
+        "t_4a": t_4a,
+        "t_4b": t_4b,
+        "t_4c": t_4c,
+        "t_4d": t_4d,
+        "t_4e": t_4e,
+        "t_4f": t_4f,
+        "t_ready": t_ready,
+    })
+    return m
+
+
+def compute_restore_metrics(pod):
+    """Computes contiguous Restore metrics (1, 1a..1d, 4e, 4f, 3) for Pod 2."""
+    t_1d, k8s = compute_k8s_metrics(pod)
+    log = pod["log"]
+    t_4e = max(t_1d, log.get("restore_ts") or pod.get("restored") or t_1d)
+    up = log.get("up_ts") or log.get("resumed_ts")
+    t_4f = max(t_4e, up or t_4e)
+    t_ready = max(t_4f, pod.get("ready") or t_4f)
+    m = dict(k8s)
+    m.update({
+        "4e": (t_4e - t_1d).total_seconds(),
+        "4f": (t_4f - t_4e).total_seconds(),
+        "3": (t_ready - t_4f).total_seconds(),
+        "t_4e": t_4e,
+        "t_4f": t_4f,
+        "t_ready": t_ready,
+    })
+    return m
+
+
+def build_csv_rows(
+    p1,
+    p2,
+    snap_ready=None,
+    orig_rows=None,
+    totals=None,
+    speedup=None,
+    steps=None,
+    latencies=None,
+    engine="",
+):
+    """Returns a list of (ModelServer, Mode, MetricName, MetricValue) tuples combining:
+    1. The Unified Metric Hierarchy (1..4f)
+    2. The 4 Composite Metrics Used for Alerting
+    3. All metrics from the original report (totals, PodSnapshot Ready, speedups, original
+       engine-specific breakdown rows, CUDA graph / safetensors details, run_demo.sh steps,
+       and test request latencies).
+    """
+    active_pod = p1 or p2
+    eng = engine or (active_pod.get("engine") or active_pod["log"].get("engine") if active_pod else "")
+    model_server = engine_display(eng)
+    out = []
+    seen = set()
+
+    def add_row(mode, name, val):
+        if val is None:
+            return
+        key = (mode, name)
+        if key not in seen:
+            seen.add(key)
+            out.append((model_server, mode, name, float(val)))
+
+    cold_m = compute_cold_metrics(p1) if (p1 and p1.get("created") and not is_restored(p1)) else None
+    rest_m = compute_restore_metrics(p2) if (p2 and p2.get("created") and is_restored(p2)) else None
+
+    # 1. Unified Metric Hierarchy (1..4f)
+    if cold_m is not None:
+        cold_items = [
+            ("1. Kubernetes: schedule the pod and start the container", cold_m["1"]),
+            ("1a. Wait for a GPU node", cold_m["1a"]),
+            ("1b. Set up the pod sandbox (gvisor)", cold_m["1b"]),
+            ("1c. Pull the image (image streaming)", cold_m["1c"]),
+            ("1d. Start the container", cold_m["1d"]),
+            ("2. LLM Engine cold start (vLLM / SGLang)", cold_m["2"]),
+            ("2a. Start Python", cold_m["2a"]),
+            ("2b. Import engine and dependencies (vLLM / SGLang, PyTorch)", cold_m["2b"]),
+            ("2c. Initialize LLM engine and background workers/processes", cold_m["2c"]),
+            ("2d. Download and load model weights", cold_m["2d"]),
+            ("2e. Allocate KV cache memory", cold_m["2e"]),
+            ("2f. Capture CUDA graphs / compile execution graph", cold_m["2f"]),
+            ("2g. Start API server / frontend and run warm-up requests", cold_m["2g"]),
+            ("3. Wait for the readiness probe", cold_m["3"]),
+            ("4. Take the snapshot (phase 5)", cold_m["4"]),
+            ("4a. Freeze Python garbage collection", cold_m["4a"]),
+            ("4b. Wait for an idle scheduler", cold_m["4b"]),
+            ("4c. Release GPU memory (weights + KV cache) to CPU RAM", cold_m["4c"]),
+            ("4d. Purge the local weight cache", cold_m["4d"]),
+            ("4e. gVisor checkpoint + upload to GCS", cold_m["4e"]),
+            ("4f. Resume GPU memory (weights + KV cache)", cold_m["4f"]),
+        ]
+        for name, val in cold_items:
+            add_row("ColdStart", name, val)
+
+    if rest_m is not None:
+        rest_items = [
+            ("1. Kubernetes: schedule the pod and start the container", rest_m["1"]),
+            ("1a. Wait for a GPU node", rest_m["1a"]),
+            ("1b. Set up the pod sandbox (gvisor)", rest_m["1b"]),
+            ("1c. Pull the image (image streaming)", rest_m["1c"]),
+            ("1d. Start the container", rest_m["1d"]),
+            ("3. Wait for the readiness probe", rest_m["3"]),
+            ("4e. gVisor checkpoint + upload to GCS", rest_m["4e"]),
+            ("4f. Resume GPU memory (weights + KV cache)", rest_m["4f"]),
+        ]
+        for name, val in rest_items:
+            add_row("Restore", name, val)
+
+    # 2. Composite Metrics Used for Alerting
+    if cold_m is not None:
+        add_row("ColdStart", "Ready-to-Serve (Cold Start)", cold_m["1"] + cold_m["2"] + cold_m["3"])
+    if rest_m is not None:
+        add_row(
+            "Restore",
+            "Ready-to-Serve (Restore)",
+            rest_m["1"] + rest_m["4e"] + rest_m["4f"] + rest_m["3"],
         )
-        steps += [
-            ("Restore the snapshot", [Point("Restore the snapshot", restored or pod["restored"], bool(restored))]),
-            (resume_label, [Point(resume_label, up)]),
-        ]
-    elif eng == "vllm":
-        graphs = ", ".join(f"{kind} {fmt_dur(secs, 1)}" for kind, secs in log["graphs"] if kind)
-        weights = "Download and load" if log.get("download") else "Load"
-        steps += [
-            ("vLLM cold start (phases 1-4)", [
-                Point("Start Python", log.get("launcher_ts")),
-                Point("Import vLLM and hook API server", log.get("hook_ts")),
-                Point("Start EngineCore subprocess", log.get("workers_ts")),
-                Point("Initialize model runner", log.get("weights_begin_ts")),
-                Point(f"{weights} the model weights", log.get("weights_end_ts")),
-                Point("Profile memory and allocate the KV cache", log.get("kv_ts")),
-                Point("Compile model (torch.compile)", log.get("compile_ts")),
-                Point(f"Capture CUDA graphs ({graphs})" if graphs else "Capture CUDA graphs",
-                      log.get("graph_end_ts")),
-                Point("Finish engine warmup and start lifespan", log.get("warmup_done_ts") or log.get("sleep_start_ts")),
-            ]),
-            ("Take the snapshot (phase 5)", [
-                Point("Release GPU memory (engine.sleep(level=1)) to CPU RAM", log.get("released_ts")),
-                Point("Purge the local weight cache", log.get("purged_ts")),
-                Point("gVisor checkpoint + upload to GCS", log.get("checkpoint_ts")),
-                Point("Resume GPU memory (engine.wake_up())", up),
-            ]),
-        ]
+    if cold_m is not None:
+        add_row("ColdStart", "Application Cold Start", cold_m["2"])
+        add_row("ColdStart", "Total Snapshot Overhead Time", cold_m["4"])
+
+    # 3. Additional metrics from the original report not already covered by 1..4f or Composites:
+    #    - Total: pod created -> Ready (ColdStart includes taking the snapshot: 1+2+3+4)
+    #    - PodSnapshot Ready (pod created -> PodSnapshot Ready)
+    #    - Speedup ratios
+    #    - run_demo.sh step durations and test request latencies
+    totals = totals or {}
+    orig_rows = orig_rows or {}
+    t1, t2 = totals.get(1), totals.get(2)
+    snap_row = next((r for r in orig_rows.get(1, []) if r.label.startswith("Take the snapshot")), None)
+    if t1 is not None:
+        add_row("ColdStart", "Total: pod created -> Ready", t1)
+    if snap_ready and p1 and p1.get("created") and snap_ready >= p1["created"]:
+        add_row("ColdStart", "PodSnapshot Ready", delta(p1["created"], snap_ready))
+    if speedup is not None and t1 and t2:
+        add_row("Restore", "Speedup vs Pod 1 (cold start + snapshot)", speedup)
+        if snap_row and t1 > snap_row.seconds:
+            add_row("Restore", "Speedup vs Pod 1 (without snapshot)", (t1 - snap_row.seconds) / t2)
+
+    if steps:
+        cum_steps = 0.0
+        for n, (label, secs) in enumerate(steps, 1):
+            cum_steps += secs
+            add_row("Pipeline", f"Step {n}. {label}", secs)
+        add_row("Pipeline", "Total: run_demo.sh steps", cum_steps)
+    if latencies:
+        for label, secs in latencies:
+            lat_mode = "ColdStart" if "Pod 1" in label else ("Restore" if "Pod 2" in label else "Verify")
+            if label.endswith(" TTFT"):
+                add_row(lat_mode, "TTFT", secs)
+            elif label.endswith(" ITL/TPOT") or label.endswith(" ITL / TPOT"):
+                add_row(lat_mode, "ITL / TPOT", secs)
+            else:
+                add_row(lat_mode, f"Completion request to {label}", secs)
+
+    return out, cold_m, rest_m
+
+
+FINE_GRAINED_METRICS = frozenset({"TTFT", "ITL / TPOT"})
+
+
+def _fmt_csv_val(name, val):
+    return f"{val:.4f}" if name in FINE_GRAINED_METRICS else f"{val:.2f}"
+
+
+def format_r_dataframe(csv_text):
+    """Formats CSV text into R syntax creating a `data` vector and `df` data.frame."""
+    lines = [line for line in csv_text.splitlines() if line]
+    escaped = [line.replace("\\", "\\\\").replace('"', '\\"') for line in lines]
+    body = ",\n".join(f'  "{line}"' for line in escaped)
+    return f"data <- c(\n{body}\n)\n\ndf <- read.csv(text = data, stringsAsFactors = FALSE)\n"
+
+
+def _r_path_for(csv_path):
+    r_env = os.environ.get("R_FILE", "").strip()
+    if r_env:
+        return pathlib.Path(r_env)
+    return pathlib.Path(csv_path).with_suffix(".R")
+
+
+def write_and_format_csv(engine_rows, csv_path=""):
+    """Appends engine_rows into csv_path (if given) and its companion .R file with Seq = iteration number."""
+    existing_rows = []
+    if csv_path:
+        p = pathlib.Path(csv_path)
+        if p.exists():
+            try:
+                with p.open("r", encoding="utf-8", newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        ms = row.get("ModelServer", "")
+                        if ms:
+                            existing_rows.append((
+                                int(row.get("Seq", 1)),
+                                ms,
+                                row.get("Mode", ""),
+                                row.get("MetricName", ""),
+                                float(row.get("MetricValue", 0.0)),
+                            ))
+            except (OSError, ValueError):
+                pass
+
+    current_ms = engine_rows[0][0] if engine_rows else ""
+    env_seq = os.environ.get("SEQ", "").strip()
+    if env_seq.isdigit() and int(env_seq) > 0:
+        next_seq = int(env_seq)
+        existing_rows = [r for r in existing_rows if not (r[0] == next_seq and r[1] == current_ms)]
     else:
-        graphs = ", ".join(f"{kind} {fmt_dur(secs, 1)}" for kind, secs in log["graphs"] if kind)
-        weights = "Download and load" if log.get("download") else "Load"
-        steps += [
-            ("SGLang cold start (phases 1-4)", [
-                Point("Start Python", log.get("launcher_ts")),
-                Point("Import SGLang and PyTorch", log.get("hook_ts")),
-                Point("Start the scheduler + detokenizer; they import SGLang again", log.get("workers_ts")),
-                Point("Initialize the scheduler", log.get("weights_begin_ts")),
-                Point(f"{weights} the model weights", log.get("weights_end_ts")),
-                Point("Allocate the KV cache", log.get("kv_ts")),
-                Point(f"Capture CUDA graphs ({graphs})" if graphs else "Capture CUDA graphs",
-                      log.get("graph_end_ts")),
-                Point("Start the HTTP server and warm up", log.get("warmup_done_ts")),
-            ]),
-            ("Take the snapshot (phase 5)", [
-                Point("Freeze Python garbage collection", log.get("gc_ts")),
-                Point("Wait for an idle scheduler", log.get("idle_ts")),
-                Point("Release GPU memory (weights + KV cache) to CPU RAM", log.get("released_ts")),
-                Point("Purge the local weight cache", log.get("purged_ts")),
-                Point("gVisor checkpoint + upload to GCS", log.get("checkpoint_ts")),
-                Point("Resume GPU memory (weights + KV cache)", up),
-            ]),
+        next_seq = max((r[0] for r in existing_rows if r[1] == current_ms), default=0) + 1
+    new_sequenced = [(next_seq, ms, mode, name, val) for ms, mode, name, val in engine_rows]
+    all_rows = existing_rows + new_sequenced
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(["Seq", "ModelServer", "Mode", "MetricName", "MetricValue"])
+    for seq, ms, mode, name, val in all_rows:
+        writer.writerow([seq, ms, mode, name, _fmt_csv_val(name, val)])
+    csv_text = buf.getvalue()
+
+    if csv_path and all_rows:
+        try:
+            pathlib.Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(csv_path).write_text(csv_text, encoding="utf-8")
+            r_path = _r_path_for(csv_path)
+            r_path.parent.mkdir(parents=True, exist_ok=True)
+            r_path.write_text(format_r_dataframe(csv_text), encoding="utf-8")
+        except OSError as exc:
+            print(f"WARNING: could not write CSV/R output to {csv_path}: {exc}", file=sys.stderr)
+
+    eng_buf = io.StringIO()
+    eng_writer = csv.writer(eng_buf, lineterminator="\n")
+    eng_writer.writerow(["Seq", "ModelServer", "Mode", "MetricName", "MetricValue"])
+    for seq, ms, mode, name, val in new_sequenced:
+        eng_writer.writerow([seq, ms, mode, name, _fmt_csv_val(name, val)])
+    return eng_buf.getvalue()
+
+
+def pod_steps(pod):
+    """The steps from pod creation to Ready, using the unified 1..4 metric hierarchy."""
+    if is_restored(pod):
+        m = compute_restore_metrics(pod)
+        return [
+            Row(
+                "Kubernetes: schedule the pod and start the container",
+                m["1"],
+                m["t_1d"],
+                False,
+                (
+                    Row("Wait for a GPU node", m["1a"], m["t_1a"], False),
+                    Row("Set up the pod sandbox (gvisor)", m["1b"], m["t_1b"], False),
+                    Row("Pull the image (image streaming)", m["1c"], m["t_1c"], False),
+                    Row("Start the container", m["1d"], m["t_1d"], False),
+                ),
+            ),
+            Row("Restore the snapshot (4e. gVisor checkpoint / GCS transfer)", m["4e"], m["t_4e"], True),
+            Row("Resume GPU memory (weights + KV cache) (4f)", m["4f"], m["t_4f"], True),
+            Row("Wait for the readiness probe (3)", m["3"], m["t_ready"], False),
         ]
-    steps.append(("Wait for the readiness probe", [Point("Wait for the readiness probe", pod["ready"], False)]))
-    return steps
+
+    m = compute_cold_metrics(pod)
+    return [
+        Row(
+            "Kubernetes: schedule the pod and start the container",
+            m["1"],
+            m["t_1d"],
+            False,
+            (
+                Row("Wait for a GPU node", m["1a"], m["t_1a"], False),
+                Row("Set up the pod sandbox (gvisor)", m["1b"], m["t_1b"], False),
+                Row("Pull the image (image streaming)", m["1c"], m["t_1c"], False),
+                Row("Start the container", m["1d"], m["t_1d"], False),
+            ),
+        ),
+        Row(
+            "LLM Engine cold start (vLLM / SGLang)",
+            m["2"],
+            m["t_2g"],
+            True,
+            (
+                Row("Start Python", m["2a"], m["t_2a"], True),
+                Row("Import engine and dependencies (vLLM / SGLang, PyTorch)", m["2b"], m["t_2b"], True),
+                Row("Initialize LLM engine and background workers/processes", m["2c"], m["t_2c"], True),
+                Row("Download and load model weights", m["2d"], m["t_2d"], True),
+                Row("Allocate KV cache memory", m["2e"], m["t_2e"], True),
+                Row("Capture CUDA graphs / compile execution graph", m["2f"], m["t_2f"], True),
+                Row("Start API server / frontend and run warm-up requests", m["2g"], m["t_2g"], True),
+            ),
+        ),
+        Row("Wait for the readiness probe", m["3"], m["t_ready"], False),
+        Row(
+            "Take the snapshot (phase 5)",
+            m["4"],
+            m["t_4f"],
+            True,
+            (
+                Row("Freeze Python garbage collection", m["4a"], m["t_4a"], True),
+                Row("Wait for an idle scheduler", m["4b"], m["t_4b"], True),
+                Row("Release GPU memory (weights + KV cache) to CPU RAM", m["4c"], m["t_4c"], True),
+                Row("Purge the local weight cache", m["4d"], m["t_4d"], True),
+                Row("gVisor checkpoint + upload to GCS", m["4e"], m["t_4e"], True),
+                Row("Resume GPU memory (weights + KV cache)", m["4f"], m["t_4f"], True),
+            ),
+        ),
+    ]
 
 
 def build_rows(start, steps):
-    """Turns pod_steps() into rows. Each point ends the interval that began at the previous point,
-    so the sub-steps add up to their step and the steps add up to the total. A point without a
-    timestamp is merged into the next point of its step; a step without timestamps is left out."""
+    """Compatibility wrapper: if steps are already Row objects from pod_steps(), return them."""
+    if steps and isinstance(steps[0], Row):
+        return list(steps)
     rows = []
     prev, prev_precise = start, False
     for label, points in steps:
@@ -1198,7 +1573,6 @@ def build_rows(start, steps):
             if point.ts > prev:
                 end, end_precise = point.ts, point.precise
             else:
-                # Whole-second Kubernetes timestamps can be a little earlier than log timestamps.
                 end, end_precise = prev, prev_precise
             subs.append(Row(point.label, (end - prev).total_seconds(), end, prev_precise and end_precise))
             prev, prev_precise = end, end_precise
@@ -1262,10 +1636,11 @@ def comparison(p1, p2, rows, totals):
     return lines, t1 / t2
 
 
-def print_pod(number, pod, rows, snap_ready):
+def print_pod(number, pod, rows, snap_ready, title_prefix=""):
     created = pod["created"]
     eng_disp = engine_display(pod.get("engine") or pod["log"].get("engine"))
-    title = f"POD {number} ({eng_disp}): {kind_text(pod)}" if eng_disp != "Model Server" else f"POD {number}: {kind_text(pod)}"
+    base = f"POD {number} ({eng_disp}): {kind_text(pod)}" if eng_disp != "Model Server" else f"POD {number}: {kind_text(pod)}"
+    title = f"{title_prefix}{base}" if title_prefix else base
     table_header(title, "Duration", "Cumulative")
     print(f"  {clean(pod['name'], WIDTH - 30)}, created at {clock(created)}")
     print("-" * WIDTH)
@@ -1283,7 +1658,7 @@ def print_pod(number, pod, rows, snap_ready):
         print(f"  The PodSnapshot was Ready at {fmt_cum(delta(created, snap_ready))} ({clock(snap_ready)}).")
 
 
-def print_report(p1, p2, snap_ready, steps, latencies, engine=""):
+def print_report(p1, p2, snap_ready, steps, latencies, engine="", csv_path=""):
     pods = [(number, pod) for number, pod in ((1, p1), (2, p2)) if pod and pod["created"]]
     rows = {number: build_rows(pod["created"], pod_steps(pod)) for number, pod in pods}
     totals = {number: delta(pod["created"], pod["ready"]) for number, pod in pods}
@@ -1308,6 +1683,30 @@ def print_report(p1, p2, snap_ready, steps, latencies, engine=""):
     for number, pod in pods:
         print_pod(number, pod, rows[number], snap_ready if number == 1 else None)
 
+    csv_rows, cold_m, rest_m = build_csv_rows(
+        p1,
+        p2,
+        snap_ready=snap_ready,
+        orig_rows=rows,
+        totals=totals,
+        speedup=speedup,
+        steps=steps,
+        latencies=latencies,
+        engine=engine,
+    )
+    if cold_m is not None or rest_m is not None:
+        table_header(f"COMPOSITE METRICS USED FOR ALERTING{hdr_suffix}", "Computation", "Seconds")
+        print("-" * WIDTH)
+        if cold_m is not None:
+            rts_cold = cold_m["1"] + cold_m["2"] + cold_m["3"]
+            table_line("Ready-to-Serve (Cold Start)", "Rows 1+2+3", f"{rts_cold:.2f}s")
+        if rest_m is not None:
+            rts_rest = rest_m["1"] + rest_m["4e"] + rest_m["4f"] + rest_m["3"]
+            table_line("Ready-to-Serve (Restore)", "1a-d+4e+4f+3", f"{rts_rest:.2f}s")
+        if cold_m is not None:
+            table_line("Application Cold Start", "Row 2 (2a-g)", f"{cold_m['2']:.2f}s")
+            table_line("Total Snapshot Overhead Time", "Row 4 (4a-f)", f"{cold_m['4']:.2f}s")
+
     if steps:
         table_header("RUN_DEMO.SH STEPS (wall clock; pauses between steps not counted)", "Duration", "Cumulative")
         print("-" * WIDTH)
@@ -1321,8 +1720,18 @@ def print_report(p1, p2, snap_ready, steps, latencies, engine=""):
         table_header("TEST REQUESTS (run_demo.sh verify)", "Latency")
         print("-" * WIDTH)
         for label, secs in latencies:
-            text = clean(f"Completion request to {label}", WIDTH - COL_W - 2)
-            print(f"  {text:<{WIDTH - COL_W - 2}}{fmt_dur(secs, 2):>{COL_W}}")
+            if label.endswith(" TTFT") or label.endswith(" ITL/TPOT") or label.endswith(" ITL / TPOT"):
+                text = clean(label.replace("ITL/TPOT", "ITL / TPOT"), WIDTH - COL_W - 2)
+                print(f"  {text:<{WIDTH - COL_W - 2}}{fmt_dur(secs, 4):>{COL_W}}")
+            else:
+                text = clean(f"Completion request to {label}", WIDTH - COL_W - 2)
+                print(f"  {text:<{WIDTH - COL_W - 2}}{fmt_dur(secs, 2):>{COL_W}}")
+    if csv_rows:
+        csv_text = write_and_format_csv(csv_rows, csv_path=csv_path)
+        saved_note = f" (saved to {csv_path} and {_r_path_for(csv_path)})" if csv_path else ""
+        table_header(f"CSV RESULTS{hdr_suffix}{saved_note}")
+        print("-" * WIDTH)
+        print(csv_text.rstrip("\n"))
     print("=" * WIDTH)
     if pods:
         recap = ", ".join(f"Pod {number} {fmt_total(totals[number])}" for number, _ in pods)
@@ -1347,6 +1756,7 @@ def main(argv=None):
     report.add_argument("--selector", required=True)
     report.add_argument("--engine", default="", help="engine type: vllm or sglang")
     report.add_argument("--cold-cache", default="", help="optional path to read/write Pod 1 cold-start timings")
+    report.add_argument("--csv", default="", help="optional path to write CSV metrics")
     report.add_argument("--step", action="append", metavar="LABEL=SECONDS", help="wall-clock time of a step")
     report.add_argument("--latency", action="append", metavar="POD=SECONDS", help="test request latency")
     args = parser.parse_args(argv)

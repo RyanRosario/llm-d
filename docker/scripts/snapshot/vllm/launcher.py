@@ -18,23 +18,18 @@ from typing import Optional
 
 from .wrapper import patch_vllm_lifespan
 
-try:
-    from vllm.logger import init_logger
-
-    logger = init_logger("vllm.snapshot.launcher")
-except ImportError:
-    logger = logging.getLogger("vllm.snapshot.launcher")
-    if not logger.handlers:
-        _handler = logging.StreamHandler(sys.stdout)
-        _handler.setFormatter(
-            logging.Formatter(
-                "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)d] %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
+logger = logging.getLogger("vllm.snapshot.launcher")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(
+        logging.Formatter(
+            "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)d] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
         )
-        logger.addHandler(_handler)
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
+    )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 def _hook_api_server() -> bool:

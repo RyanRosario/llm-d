@@ -25,12 +25,18 @@ from ..providers import (
     get_snapshot_provider,
 )
 
-try:
-    from vllm.logger import init_logger
-
-    logger = init_logger("vllm.snapshot.wrapper")
-except ImportError:
-    logger = logging.getLogger("vllm.snapshot.wrapper")
+logger = logging.getLogger("vllm.snapshot.wrapper")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(
+        logging.Formatter(
+            "[%(asctime)s] %(levelname)s [%(name)s:%(lineno)d] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 def _is_eager_loading_configured() -> bool:
