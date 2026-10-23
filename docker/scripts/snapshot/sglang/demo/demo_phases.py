@@ -1357,14 +1357,23 @@ def build_csv_rows(
 
     # 2. Composite Metrics Used for Alerting
     if cold_m is not None:
-        add_row("ColdStart", "Ready-to-Serve (Cold Start)", cold_m["1"] + cold_m["2"] + cold_m["3"])
+        add_row(
+            "ColdStart",
+            "E2E Cold Start (including node provisioning)",
+            cold_m["1"] + cold_m["2"] + cold_m["3"],
+        )
     if rest_m is not None:
         add_row(
             "Restore",
-            "Ready-to-Serve (Restore)",
-            rest_m["1"] + rest_m["4e"] + rest_m["4f"] + rest_m["3"],
+            "Warm Start (from restoration)",
+            rest_m["1b"] + rest_m["1c"] + rest_m["1d"] + rest_m["4e"] + rest_m["4f"] + rest_m["3"],
         )
     if cold_m is not None:
+        add_row(
+            "ColdStart",
+            "Cold Start (excluding node provisioning)",
+            cold_m["1b"] + cold_m["1c"] + cold_m["1d"] + cold_m["2"] + cold_m["3"],
+        )
         add_row("ColdStart", "Application Cold Start", cold_m["2"])
         add_row("ColdStart", "Total Snapshot Overhead Time", cold_m["4"])
 
@@ -1698,12 +1707,14 @@ def print_report(p1, p2, snap_ready, steps, latencies, engine="", csv_path=""):
         table_header(f"COMPOSITE METRICS USED FOR ALERTING{hdr_suffix}", "Computation", "Seconds")
         print("-" * WIDTH)
         if cold_m is not None:
-            rts_cold = cold_m["1"] + cold_m["2"] + cold_m["3"]
-            table_line("Ready-to-Serve (Cold Start)", "Rows 1+2+3", f"{rts_cold:.2f}s")
+            e2e_cold = cold_m["1"] + cold_m["2"] + cold_m["3"]
+            table_line("E2E Cold Start (including node provisioning)", "Rows 1+2+3", f"{e2e_cold:.2f}s")
         if rest_m is not None:
-            rts_rest = rest_m["1"] + rest_m["4e"] + rest_m["4f"] + rest_m["3"]
-            table_line("Ready-to-Serve (Restore)", "1a-d+4e+4f+3", f"{rts_rest:.2f}s")
+            warm_rest = rest_m["1b"] + rest_m["1c"] + rest_m["1d"] + rest_m["4e"] + rest_m["4f"] + rest_m["3"]
+            table_line("Warm Start (from restoration)", "1b-d+4e+4f+3", f"{warm_rest:.2f}s")
         if cold_m is not None:
+            cold_excl = cold_m["1b"] + cold_m["1c"] + cold_m["1d"] + cold_m["2"] + cold_m["3"]
+            table_line("Cold Start (excluding node provisioning)", "1b-d+2+3", f"{cold_excl:.2f}s")
             table_line("Application Cold Start", "Row 2 (2a-g)", f"{cold_m['2']:.2f}s")
             table_line("Total Snapshot Overhead Time", "Row 4 (4a-f)", f"{cold_m['4']:.2f}s")
 

@@ -93,6 +93,7 @@ GPU_ACCELERATOR="${GPU_ACCELERATOR:-nvidia-h100-80gb}"
 GPU_COUNT="${GPU_COUNT:-1}"
 MAX_NODES="${MAX_NODES:-2}"
 DISK_SIZE="${DISK_SIZE:-200GB}"
+LOCAL_SSD_COUNT="${LOCAL_SSD_COUNT:-2}"
 MODEL="${MODEL:-Qwen/Qwen3-32B}"
 CURL_TEST_IMAGE="${CURL_TEST_IMAGE:-cfmanteiga/alpine-bash-curl-jq:latest}"
 NODE_CLEANER_IMAGE="${NODE_CLEANER_IMAGE:-alpine:3.20}"
@@ -576,6 +577,9 @@ step_provision() {
     if [[ "${SPOT:-0}" == "1" ]]; then
       extra_np_flags+=("--spot")
     fi
+    if (( LOCAL_SSD_COUNT > 0 )); then
+      extra_np_flags+=("--ephemeral-storage-local-ssd" "count=${LOCAL_SSD_COUNT}")
+    fi
     run gcloud container node-pools create "${NODE_POOL_NAME}" \
       --project="${PROJECT_ID}" \
       --cluster="${CLUSTER_NAME}" \
@@ -625,7 +629,8 @@ step_provision() {
     run gcloud iam roles create podSnapshotGcsReadWriter \
       --project="${PROJECT_ID}" \
       --title="Pod Snapshot GCS Read/Writer" \
-      --permissions="storage.buckets.get,storage.objects.get,storage.objects.list,storage.objects.create,storage.objects.delete,storage.folders.create"
+      --permissions="storage.buckets.get,storage.objects.get,storage.objects.list,storage.objects.create,storage.objects.delete,storage.folders.create" \
+      || echo "  [Info] Custom role creation not permitted in '${PROJECT_ID}'; will use predefined roles (roles/storage.objectUser + roles/storage.legacyBucketReader)."
   fi
 
   echo ">>> Provisioning completed in $(( SECONDS - t_start ))s."
@@ -640,16 +645,28 @@ step_setup() {
   local t_start=$SECONDS
   banner "Step 1: Configure GCS IAM for Model Server ServiceAccount(s) & Setup Namespace/Router"
 
-  local project_number eng
+  local project_number eng use_custom_role=0
   show_cmd gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)"
   project_number="$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")"
+  if gcloud iam roles describe podSnapshotGcsReadWriter --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    use_custom_role=1
+  fi
 
   for eng in "${ENGINES[@]}"; do
     set_engine_vars "${eng}"
     echo "Binding Workload Identity KSA (${KSA_NAME}) to gs://${GCS_BUCKET}..."
-    run gcloud storage buckets add-iam-policy-binding "gs://${GCS_BUCKET}" \
-      --member="principal://iam.googleapis.com/projects/${project_number}/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/subject/ns/${NAMESPACE}/sa/${KSA_NAME}" \
-      --role="projects/${PROJECT_ID}/roles/podSnapshotGcsReadWriter"
+    if (( use_custom_role == 1 )); then
+      run gcloud storage buckets add-iam-policy-binding "gs://${GCS_BUCKET}" \
+        --member="principal://iam.googleapis.com/projects/${project_number}/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/subject/ns/${NAMESPACE}/sa/${KSA_NAME}" \
+        --role="projects/${PROJECT_ID}/roles/podSnapshotGcsReadWriter"
+    else
+      run gcloud storage buckets add-iam-policy-binding "gs://${GCS_BUCKET}" \
+        --member="principal://iam.googleapis.com/projects/${project_number}/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/subject/ns/${NAMESPACE}/sa/${KSA_NAME}" \
+        --role="roles/storage.objectUser" >/dev/null
+      run gcloud storage buckets add-iam-policy-binding "gs://${GCS_BUCKET}" \
+        --member="principal://iam.googleapis.com/projects/${project_number}/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/subject/ns/${NAMESPACE}/sa/${KSA_NAME}" \
+        --role="roles/storage.legacyBucketReader" >/dev/null
+    fi
   done
   set_engine_vars "${ENGINES[0]}"
 
