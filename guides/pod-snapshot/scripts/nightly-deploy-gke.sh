@@ -19,8 +19,8 @@
 # and Pod 2 (restored from the snapshot) both Ready.
 #
 # The threshold checks run afterwards, in the reusable's validate step:
-# e2e_validate_args: '--extra-validate pod-snapshot' hands off to
-# .github/scripts/e2e/e2e-validate-pod-snapshot.sh, which runs
+# e2e_validate_args: '--extra-validate pod-snapshot -- --engine <vllm|sglang>'
+# hands off to .github/scripts/e2e/e2e-validate-pod-snapshot.sh, which runs
 # guides/pod-snapshot/scripts/check_thresholds.py.
 #
 # Environment knobs (all optional except NAMESPACE and MODEL_SERVER):

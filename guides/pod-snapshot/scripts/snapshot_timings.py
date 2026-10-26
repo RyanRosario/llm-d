@@ -590,6 +590,11 @@ def compute_restore_metrics(pod):
     return m
 
 
+def pod_metrics(pod):
+    """The pod's metrics for the way it started: restore metrics for a restored pod, else cold."""
+    return compute_restore_metrics(pod) if is_restored(pod) else compute_cold_metrics(pod)
+
+
 # Labels of the 1..4f hierarchy, shared by the timing table and the CSV (same names as the
 # demo's results.csv). Each entry is (metric key, label).
 K8S_STEPS = (
@@ -782,8 +787,9 @@ def print_pod(number, pod, rows, snap_ready):
 def print_report(p1, p2, snap_ready, engine="", csv_path=""):
     pods = [(number, pod) for number, pod in ((1, p1), (2, p2)) if pod and pod["created"]]
     totals = {number: delta(pod["created"], pod["ready"]) for number, pod in pods}
-    cold_m = compute_cold_metrics(p1) if p1 and p1.get("created") and not is_restored(p1) else None
-    rest_m = compute_restore_metrics(p2) if p2 and p2.get("created") and is_restored(p2) else None
+    metrics = {number: pod_metrics(pod) for number, pod in pods}
+    cold_m = metrics[1] if 1 in metrics and not is_restored(p1) else None
+    rest_m = metrics[2] if 2 in metrics and is_restored(p2) else None
     t1, t2 = totals.get(1), totals.get(2)
     speedup = t1 / t2 if cold_m is not None and rest_m is not None and t1 and t2 else None
     eng_disp = engine_display(engine)
@@ -804,8 +810,7 @@ def print_report(p1, p2, snap_ready, engine="", csv_path=""):
         print("  The numbered steps add up to the total, and the lettered sub-steps add up to their step.")
         print("  Cumulative: the time since the pod was created, at the end of the step.")
     for number, pod in pods:
-        m = compute_restore_metrics(pod) if is_restored(pod) else compute_cold_metrics(pod)
-        print_pod(number, pod, pod_rows(pod, m), snap_ready if number == 1 else None)
+        print_pod(number, pod, pod_rows(pod, metrics[number]), snap_ready if number == 1 else None)
 
     composites = composite_metrics(cold_m, rest_m)
     if composites:

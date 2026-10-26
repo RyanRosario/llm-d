@@ -184,10 +184,21 @@ def metrics_pod(*, created=0, scheduled=5, sandbox=30, pulled=50, started=55, re
     }
 
 
-def cold_log(**overrides):
-    ts = {"launcher_ts": 60, "hook_ts": 70, "workers_ts": 80, "weights_begin_ts": 90, "weights_end_ts": 160,
-          "kv_ts": 167, "compile_ts": 180, "graph_end_ts": 200, "warmup_done_ts": 205, "sleep_start_ts": 207,
-          "released_ts": 215, "checkpoint_ts": 250, "resumed_ts": 260, "up_ts": 261}
+COLD_MARKERS = {"launcher_ts": 60, "hook_ts": 70, "workers_ts": 80, "weights_begin_ts": 90, "weights_end_ts": 160,
+                "kv_ts": 167, "compile_ts": 180, "graph_end_ts": 200, "warmup_done_ts": 205, "sleep_start_ts": 207,
+                "released_ts": 215, "checkpoint_ts": 250, "resumed_ts": 260, "up_ts": 261}
+
+
+def cold_log(shift=0, after=None, **overrides):
+    """A parsed cold-start log. `shift` moves every marker; `after=(key, secs)` moves only the
+    markers from `key` on (e.g. a slow phase); `overrides` set or (with None) drop single markers."""
+    ts = dict(COLD_MARKERS)
+    if after:
+        key, secs = after
+        keys = list(COLD_MARKERS)
+        for k in keys[keys.index(key):]:
+            ts[k] += secs
+    ts = {k: v + shift for k, v in ts.items()}
     ts.update(overrides)
     out = {k: at(v) for k, v in ts.items() if v is not None}
     out.update(engine="vllm", hook_s=9.8)
@@ -328,10 +339,7 @@ def test_slow_e2e_cold_start_fails_only_that_check():
     p1["scheduled"] = at(1600)  # a 1600s wait for a GPU node: ECS = 1600 + ... > 1800
     p1["sandbox"] = p1["pulling_ts"] = at(1625)
     p1["pulled_ts"], p1["started"] = at(1645), at(1650)
-    p1["log"] = cold_log(**{k: v + 1595 for k, v in {
-        "launcher_ts": 60, "hook_ts": 70, "workers_ts": 80, "weights_begin_ts": 90, "weights_end_ts": 160,
-        "kv_ts": 167, "compile_ts": 180, "graph_end_ts": 200, "warmup_done_ts": 205, "sleep_start_ts": 207,
-        "released_ts": 215, "checkpoint_ts": 250, "resumed_ts": 260, "up_ts": 261}.items()})
+    p1["log"] = cold_log(shift=1595)
     p1["ready"] = at(1895)
     checks = ct.evaluate(p1, p2, "vllm")
     # ECS = 1650 + 152 + 39 = 1841 > 1800; CS is unchanged and the speedup only grows.
@@ -342,10 +350,7 @@ def test_slow_e2e_cold_start_fails_only_that_check():
 def test_slow_application_cold_start_fails_cold_start_but_not_the_node_wait():
     p1, p2 = good_pods()
     # Weights took 300s instead of 70s: CS = 25 + 20 + 5 + 382 > 350, but ECS still < 1800.
-    shifted = {k: v + 230 for k, v in {
-        "weights_end_ts": 160, "kv_ts": 167, "compile_ts": 180, "graph_end_ts": 200, "warmup_done_ts": 205,
-        "sleep_start_ts": 207, "released_ts": 215, "checkpoint_ts": 250, "resumed_ts": 260, "up_ts": 261}.items()}
-    p1["log"] = cold_log(**shifted)
+    p1["log"] = cold_log(after=("weights_end_ts", 230))
     p1["ready"] = at(530)
     failed = names_of(ct.evaluate(p1, p2, "vllm"), False)
     assert "Cold Start, no node provisioning (1b+1c+1d+2)" in failed
@@ -359,9 +364,8 @@ def test_slow_application_cold_start_fails_cold_start_but_not_the_node_wait():
 def test_snapshot_overhead_is_checked_against_the_engine_threshold(engine, overhead, ok):
     p1, p2 = good_pods()
     # Stretch the checkpoint (4e) so row 4 = overhead; keep everything after it contiguous.
-    extra = overhead - 54
-    p1["log"] = cold_log(checkpoint_ts=250 + extra, resumed_ts=260 + extra, up_ts=261 + extra)
-    p1["ready"] = at(300 + extra)
+    p1["log"] = cold_log(after=("checkpoint_ts", overhead - 54))
+    p1["ready"] = at(300 + overhead - 54)
     failed = names_of(ct.evaluate(p1, p2, engine), False)
     assert ("Total Snapshot Overhead Time (Row 4)" in failed) is (not ok)
 
@@ -385,11 +389,7 @@ def test_slow_restore_fails_the_speedup_check():
 def test_pod_2_that_cold_started_instead_of_restoring_fails():
     p1, _ = good_pods()
     p2 = metrics_pod(created=1000, scheduled=1005, sandbox=1030, pulled=1050, started=1055, ready=1300,
-                     log=cold_log(**{k: v + 1000 for k, v in {
-                         "launcher_ts": 60, "hook_ts": 70, "workers_ts": 80, "weights_begin_ts": 90,
-                         "weights_end_ts": 160, "kv_ts": 167, "compile_ts": 180, "graph_end_ts": 200,
-                         "warmup_done_ts": 205, "sleep_start_ts": 207, "released_ts": 215,
-                         "checkpoint_ts": 250, "resumed_ts": 260, "up_ts": 261}.items()}))
+                     log=cold_log(shift=1000))
     checks = ct.evaluate(p1, p2, "vllm")
     failed = names_of(checks, False)
     assert failed == ["Application Cold Start on Pod 2 (Row 2)"]
@@ -435,7 +435,7 @@ def test_load_pods_picks_oldest_as_pod_1_and_reads_the_cluster_once(engine):
     gets = [c[1] for c in kube.calls if c[0] == "get"]
     assert sorted(gets) == ["events", "pods", "podsnapshots"]
     assert [c[1] for c in kube.calls if c[0] == "logs"] == ["ms-1", "ms-2"]
-    assert ("get", "pods", "-l", SELECTOR) == kube.calls[0]
+    assert kube.calls[0] == ("get", "pods", "-l", SELECTOR)
 
 
 def test_load_pods_ignores_terminating_pods():
@@ -492,7 +492,7 @@ def test_csv_has_five_columns_and_the_composite_metrics(tmp_path):
     assert (tmp_path / "results.csv").read_text() == text
     assert all(line.startswith("1,vLLM,") for line in lines[1:])
     by_name = {}
-    for model_server, mode, name, val in rows:
+    for _model_server, mode, name, val in rows:
         by_name[(mode, name)] = val
     assert by_name[("ColdStart", "E2E Cold Start (including node provisioning)")] == pytest.approx(246)
     assert by_name[("ColdStart", "Cold Start (excluding node provisioning)")] == pytest.approx(202)
@@ -522,7 +522,7 @@ def test_report_prints_both_pods_and_the_composites(capsys):
 
 def test_main_runs_the_checks_even_if_the_report_crashes(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(st, "load_pods", lambda kube, selector, engine="": (*good_pods(), at(290)))
-    monkeypatch.setattr(st, "print_report", lambda *a, **k: 1 / 0)
+    monkeypatch.setattr(st, "print_report", lambda *_a, **_k: 1 / 0)
     summary = tmp_path / "summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
     rc = ct.main(["--namespace", "ns", "--engine", "vllm", "--csv", str(tmp_path / "r.csv")])
@@ -546,13 +546,13 @@ def test_main_passes_the_csv_path_and_engine_to_the_report(monkeypatch, tmp_path
 def test_main_exits_1_on_a_failed_check(monkeypatch, capsys):
     p1, _ = good_pods()
     monkeypatch.setattr(st, "load_pods", lambda kube, selector, engine="": (p1, None, None))
-    monkeypatch.setattr(st, "print_report", lambda *a, **k: None)
+    monkeypatch.setattr(st, "print_report", lambda *_a, **_k: None)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     assert ct.main(["--namespace", "ns", "--engine", "vllm"]) == 1
     assert "FAIL: 1/" in capsys.readouterr().err
 
 
 def test_main_exits_1_when_the_cluster_cannot_be_read(monkeypatch, capsys):
-    monkeypatch.setattr(st, "Kubectl", lambda ns: FakeKubectl(fail_pods=True))
+    monkeypatch.setattr(st, "Kubectl", lambda _namespace: FakeKubectl(fail_pods=True))
     assert ct.main(["--namespace", "ns", "--engine", "vllm"]) == 1
     assert "could not list the pods" in capsys.readouterr().err
