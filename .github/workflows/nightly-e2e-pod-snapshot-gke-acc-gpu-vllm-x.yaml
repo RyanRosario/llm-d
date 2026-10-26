@@ -3,8 +3,8 @@ name: Nightly - Pod Snapshot E2E (GKE GPU vLLM)
 # Nightly regression test for the GKE Pod Snapshots guide (guides/pod-snapshot)
 # with the vLLM model server on H100 GPUs.
 #
-# Deploys via guides/pod-snapshot/scripts/nightly-deploy-gke.sh, which resets
-# existing PodSnapshot CRs and GCS snapshot objects, emits the guide.yaml
+# Deploys via guides/pod-snapshot/scripts/nightly-deploy-gke.sh, which empties
+# the GCS snapshot bucket (the namespace is fresh), emits the guide.yaml
 # commands, and waits for Pod 1 (cold start + snapshot) and Pod 2 (restore from
 # the snapshot) to be Ready. After the reusable's smoke loop, it hands off (via
 # --extra-validate) to e2e-validate-pod-snapshot.sh, which runs

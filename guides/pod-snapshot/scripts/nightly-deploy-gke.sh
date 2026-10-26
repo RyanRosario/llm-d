@@ -13,10 +13,10 @@
 # needs and waits for it, then exits. Every deploy and wait step is emitted
 # from guides/pod-snapshot/guide.yaml via `scripts/guide.py emit`, the same
 # source the README is rendered from, so a guide change reaches the nightly
-# without a second edit. Before deploying, it resets any existing PodSnapshot
-# CRs and GCS snapshot objects so Pod 1 always performs a true cold start.
-# It finishes with Pod 1 (cold start + snapshot) and Pod 2 (restored from the
-# snapshot) both Ready.
+# without a second edit. Before deploying, it empties the GCS snapshot bucket
+# (the only state that outlives the reusable's fresh namespace) so Pod 1 always
+# performs a true cold start. It finishes with Pod 1 (cold start + snapshot)
+# and Pod 2 (restored from the snapshot) both Ready.
 #
 # The threshold checks run afterwards, in the reusable's validate step:
 # e2e_validate_args: '--extra-validate pod-snapshot' hands off to
@@ -89,27 +89,6 @@ emit() {
     "$@"
 }
 
-# Waits until `kubectl get KIND [-l SELECTOR]` in NAMESPACE returns nothing; fails after TIMEOUT_S.
-wait_until_gone() {
-  local kind="$1" selector="$2" timeout_s="$3" left
-  local deadline=$(( SECONDS + timeout_s ))
-  local args=(get "${kind}" -n "${NAMESPACE}" -o name)
-  if [[ -n "${selector}" ]]; then
-    args+=(-l "${selector}")
-  fi
-  while true; do
-    left="$(kubectl "${args[@]}" 2>/dev/null)" || return 1
-    if [[ -z "${left}" ]]; then
-      return 0
-    fi
-    if (( SECONDS >= deadline )); then
-      echo "Still present after ${timeout_s}s: ${left//$'\n'/ }" >&2
-      return 1
-    fi
-    sleep 5
-  done
-}
-
 # Prints the top-level objects and folders of gs://GCS_BUCKET, one per line; nothing if empty.
 gcs_top_level() {
   local out err rc=0
@@ -152,20 +131,11 @@ clear_bucket() {
   die "gs://${GCS_BUCKET} is still not empty: ${listing//$'\n'/ }"
 }
 
-echo "=== Resetting PodSnapshot CRs and gs://${GCS_BUCKET} so Pod 1 is a true cold start ==="
-kubectl delete deployment \
-  pod-snapshot-nvidia-gpu-vllm-decode \
-  pod-snapshot-nvidia-gpu-sglang-decode \
-  -n "${NAMESPACE}" --ignore-not-found=true --wait=true --timeout=120s \
-  || die "could not delete existing model server Deployment(s) in ${NAMESPACE}"
-wait_until_gone pods "llm-d.ai/guide=${GUIDE_NAME}" 300 \
-  || die "could not confirm that existing model server pods are gone in ${NAMESPACE}"
-
-kubectl delete podsnapshots --all -n "${NAMESPACE}" --ignore-not-found=true --wait=true --timeout=300s \
-  || die "could not delete existing PodSnapshots in ${NAMESPACE}"
-wait_until_gone podsnapshots "" 60 \
-  || die "could not confirm that PodSnapshots are gone in ${NAMESPACE}"
-
+echo "=== Clearing gs://${GCS_BUCKET} so Pod 1 is a true cold start ==="
+# The reusable deletes and recreates the namespace before this script runs, so
+# there are no Deployments or PodSnapshot CRs to reset; only the GCS bucket
+# outlives a run. (If Pod 1 were ever restored from a stale snapshot anyway,
+# check_thresholds.py's "Pod 1 cold started" check fails the run.)
 clear_bucket
 
 echo "=== Installing the GAIE InferencePool CRDs ==="
