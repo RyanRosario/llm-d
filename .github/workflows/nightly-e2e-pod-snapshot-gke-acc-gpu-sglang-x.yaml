@@ -143,7 +143,6 @@ jobs:
       # this is a brief grace for the EPP to finish backend discovery before
       # the smoke loop fires (reusable default is 180s).
       pod_readiness_delay: 60
-      allow_gpu_preemption: true
       llm_d_ref: ${{ github.ref }}
       skip_cleanup: ${{ github.event.inputs.skip_cleanup == 'true' || github.event.inputs.cleanup == 'false' }}
       pr_number: ${{ github.event.inputs.pr_number }}
