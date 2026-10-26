@@ -52,17 +52,12 @@ echo "Namespace:    ${NAMESPACE}"
 echo "Router model: ${MODEL_ID:-not given}"
 echo "Results dir:  ${RESULTS_DIR}"
 
-echo "=== Pod snapshot per-phase timing report ==="
-# Informational: the full timing table for on-call, plus the per-phase CSV
-# (same format as the demo's results.csv). A failure here must not skip the
-# threshold checks below, which decide pass/fail.
-python3 "${SCRIPTS_DIR}/snapshot_timings.py" report \
-  --namespace "${NAMESPACE}" \
-  --selector "${SELECTOR}" \
-  --csv "${RESULTS_DIR}/results.csv" \
-  || echo "Warning: snapshot_timings.py report failed; continuing to the threshold checks." >&2
-
 echo "=== Checking pod-snapshot alerting thresholds ==="
+# One process, one set of kubectl calls: check_thresholds.py prints the
+# informational timing table and writes the per-phase CSV (same format as the
+# demo's results.csv; a failure there is logged, not fatal), then applies the
+# thresholds that decide pass/fail.
 exec python3 "${SCRIPTS_DIR}/check_thresholds.py" \
   --namespace "${NAMESPACE}" \
-  --selector "${SELECTOR}"
+  --selector "${SELECTOR}" \
+  --csv "${RESULTS_DIR}/results.csv"

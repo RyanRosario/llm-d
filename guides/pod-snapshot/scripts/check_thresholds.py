@@ -5,13 +5,15 @@ Called by .github/scripts/e2e/e2e-validate-pod-snapshot.sh (the nightly's
 `--extra-validate pod-snapshot` step) after guides/pod-snapshot/scripts/nightly-deploy-gke.sh
 has brought up Pod 1 (cold start + snapshot) and Pod 2 (restore from the snapshot).
 
-Reads both pods with kubectl, using the timing helpers in snapshot_timings.py, and checks the
-5 composite metrics from the GKE Pod Snapshots CI/CD Plan. Every check is evaluated and
-printed as a PASS/FAIL table (verify_helpers, shared with the other nightly verifiers);
-the exit code is 1 if any check fails and 0 if all pass.
+Reads both pods with kubectl once (snapshot_timings.load_pods), prints the informational timing
+table and writes the per-phase CSV (snapshot_timings.print_report; a failure there is logged
+and does not skip the checks), then checks the 5 composite metrics from the GKE Pod Snapshots
+CI/CD Plan. Every check is evaluated and printed as a PASS/FAIL table (verify_helpers, shared
+with the other nightly verifiers); the exit code is 1 if any check fails and 0 if all pass.
 
 Usage:
   check_thresholds.py --namespace NS [--selector llm-d.ai/guide=pod-snapshot] [--engine vllm|sglang]
+                      [--csv results.csv]
 """
 
 from __future__ import annotations
@@ -51,22 +53,6 @@ THRESHOLDS = {
     },
 }
 MAX_POD2_APP_COLD_START_S = 0.0    # ACS on Pod 2 > 0 -> fail (Pod 2 cold started instead of restoring)
-
-
-def load_pods(namespace, selector, engine):
-    """Returns (pod1, pod2) as built by snapshot_timings.pod_times, oldest first."""
-    kubectl = dp.Kubectl(namespace)
-    pods = kubectl.json("get", "pods", "-l", selector)
-    if pods is None:
-        raise RuntimeError(f"could not list pods with kubectl get pods -l {selector} -n {namespace}")
-    items = sorted(
-        (p for p in pods.get("items", []) if not p.get("metadata", {}).get("deletionTimestamp")),
-        key=lambda p: p.get("metadata", {}).get("creationTimestamp", ""),
-    )
-    events = (kubectl.json("get", "events", "--field-selector", "involvedObject.kind=Pod") or {}).get("items", [])
-    p1 = dp.pod_times(kubectl, items[0], events, engine=engine) if items else None
-    p2 = dp.pod_times(kubectl, items[-1], events, engine=engine) if len(items) >= 2 else None
-    return p1, p2
 
 
 def evaluate(p1, p2, engine: str) -> list[v.Check]:
@@ -130,18 +116,25 @@ def main(argv=None) -> int:
     parser.add_argument("--namespace", required=True)
     parser.add_argument("--selector", default="llm-d.ai/guide=pod-snapshot")
     parser.add_argument("--engine", default="", help="vllm or sglang (inferred from the pods if omitted)")
+    parser.add_argument("--csv", default="", help="optional path to write the per-phase metrics CSV")
     args = parser.parse_args(argv)
 
     engine = args.engine or str(dp.infer_engine(selector=args.selector) or "")
     try:
-        p1, p2 = load_pods(args.namespace, args.selector, engine)
+        p1, p2, snap_ready = dp.load_pods(dp.Kubectl(args.namespace), args.selector, engine)
     except RuntimeError as e:
         v.error(f"ERROR: {e}")
         return 1
-    if not engine:
-        # Same fallback as snapshot_timings.cmd_report: the engine detected from the pod logs.
-        pod = (p1 or p2) or {}
-        engine = str(pod.get("engine") or (pod.get("log") or {}).get("engine") or "")
+    engine = dp.detected_engine(p1, p2, engine)
+
+    # Informational: the full timing table for on-call, plus the per-phase CSV. It must never
+    # skip the threshold checks below, which decide pass/fail.
+    print()
+    print("=== Pod snapshot per-phase timing report ===")
+    try:
+        dp.print_report(p1, p2, snap_ready, engine=engine, csv_path=args.csv)
+    except Exception as e:  # noqa: BLE001 - any report bug is logged, not fatal
+        v.error(f"Warning: the timing report failed ({type(e).__name__}: {e}); continuing to the threshold checks.")
 
     checks = evaluate(p1, p2, engine)
     print()

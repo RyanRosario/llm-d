@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Startup, snapshot and restore timings for GKE Pod Snapshots (vLLM and SGLang).
 
-Used by the nightly in two ways:
-  - `snapshot_timings.py report` (from .github/scripts/e2e/e2e-validate-pod-snapshot.sh) prints
-    the timing table for on-call and writes the per-phase metrics as a 5-column CSV
-    (Seq, ModelServer, Mode, MetricName, MetricValue; Seq is always 1 in the nightly).
-  - check_thresholds.py imports Kubectl, pod_times, is_restored, infer_engine and the
-    compute_*_metrics helpers to evaluate the alerting thresholds.
+Used by the nightly through check_thresholds.py (from .github/scripts/e2e/e2e-validate-pod-snapshot.sh),
+which reads the cluster once with load_pods, prints the timing table for on-call with print_report
+(also writing the per-phase metrics as a 5-column CSV: Seq, ModelServer, Mode, MetricName,
+MetricValue; Seq is always 1 in the nightly), and then evaluates the alerting thresholds with the
+compute_*_metrics helpers. `snapshot_timings.py report` prints the same table by hand.
 
 Provenance: this file started as a trimmed copy of the demo's demo_phases.py (the
 pod-snapshot-sglang-demo branch, docker/scripts/snapshot/sglang/demo/demo_phases.py), which also
@@ -830,25 +829,44 @@ def print_report(p1, p2, snap_ready, engine="", csv_path=""):
         print("=" * WIDTH)
 
 
-def cmd_report(args):
-    eng = str(args.engine or infer_engine(selector=args.selector) or "")
-    kubectl = Kubectl(args.namespace)
-    pods = kubectl.json("get", "pods", "-l", args.selector)
+def load_pods(kubectl, selector, engine=""):
+    """Reads the cluster once: returns (pod1, pod2, podsnapshot_ready_ts).
+
+    Pod 1 is the oldest pod matching `selector` that is not being deleted (cold start + snapshot)
+    and Pod 2 the newest (restore from the snapshot); each is a pod_times dict, or None when
+    there are fewer than one / two pods. Raises RuntimeError when the pods cannot be listed.
+    This is the single pod-selection path shared by `report` and check_thresholds.py.
+    """
+    pods = kubectl.json("get", "pods", "-l", selector)
     if pods is None:
-        print(f"ERROR: could not list the pods with kubectl get pods -l {args.selector}.", file=sys.stderr)
-        return 1
+        raise RuntimeError(f"could not list the pods with kubectl get pods -l {selector} -n {kubectl.namespace}")
     items = sorted(
         (p for p in pods.get("items", []) if not p.get("metadata", {}).get("deletionTimestamp")),
         key=lambda p: p.get("metadata", {}).get("creationTimestamp", ""),
     )
     events = (kubectl.json("get", "events", "--field-selector", "involvedObject.kind=Pod") or {}).get("items", [])
     snaps = (kubectl.json("get", "podsnapshots") or {}).get("items", [])
-    p1 = pod_times(kubectl, items[0], events, engine=eng) if items else None
-    p2 = pod_times(kubectl, items[-1], events, engine=eng) if len(items) >= 2 else None
-    if not eng:
-        pod = p1 or p2
-        eng = str(pod.get("engine", "")) if pod else ""
-    print_report(p1, p2, snapshot_ready(snaps, pod=p1), engine=eng, csv_path=args.csv)
+    p1 = pod_times(kubectl, items[0], events, engine=engine) if items else None
+    p2 = pod_times(kubectl, items[-1], events, engine=engine) if len(items) >= 2 else None
+    return p1, p2, snapshot_ready(snaps, pod=p1)
+
+
+def detected_engine(p1, p2, engine=""):
+    """The engine given, or the one detected from the pods' labels / names / logs, or ''."""
+    if engine:
+        return str(engine)
+    pod = p1 or p2
+    return str(pod.get("engine") or pod["log"].get("engine") or "") if pod else ""
+
+
+def cmd_report(args):
+    eng = str(args.engine or infer_engine(selector=args.selector) or "")
+    try:
+        p1, p2, snap_ready = load_pods(Kubectl(args.namespace), args.selector, engine=eng)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 1
+    print_report(p1, p2, snap_ready, engine=detected_engine(p1, p2, eng), csv_path=args.csv)
     return 0
 
 
