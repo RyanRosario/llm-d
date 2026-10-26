@@ -129,7 +129,9 @@ jobs:
       custom_deploy_script: |
         MODEL_SERVER=sglang \
           bash guides/pod-snapshot/scripts/nightly-deploy-gke.sh
-      e2e_validate_args: '--extra-validate pod-snapshot'
+      # Everything after -- is forwarded to e2e-validate-pod-snapshot.sh: the engine is
+      # known here (MODEL_SERVER above), so pass it instead of inferring it from the pods.
+      e2e_validate_args: '--extra-validate pod-snapshot -- --engine sglang'
       gke_cluster_name: llm-d-e2e-pod-snapshot-us-central1
       gke_cluster_zone: us-central1
       # Two single-GPU Qwen3-32B replicas (Pod 1 cold start + snapshot, Pod 2 restore).

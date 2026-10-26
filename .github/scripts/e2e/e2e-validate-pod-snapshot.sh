@@ -23,17 +23,22 @@ Usage: $(basename "$0") [OPTIONS]
 Options:
   -n, --namespace NAMESPACE   Kubernetes namespace (default: llm-d)
   -m, --model MODEL_ID        Model the smoke loop discovered (logged only)
+  --engine ENGINE             Model server: vllm or sglang. The workflow knows it (it sets
+                              MODEL_SERVER for the deploy), so pass it rather than having
+                              the validator infer it from pod labels and logs.
   -h, --help                  Show help
 EOF
 }
 
 NAMESPACE="llm-d"
 MODEL_ID=""
+ENGINE=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     -n|--namespace) NAMESPACE="$2"; shift 2 ;;
     -m|--model)     MODEL_ID="$2"; shift 2 ;;
+    --engine)       ENGINE="$2"; shift 2 ;;
     -h|--help)      show_help; exit 0 ;;
     # Fail, not exit 0 like --help: a mistyped flag in a workflow's
     # e2e_validate_args must not pass the validation step without running it.
@@ -50,6 +55,7 @@ mkdir -p "${RESULTS_DIR}"
 
 echo "Namespace:    ${NAMESPACE}"
 echo "Router model: ${MODEL_ID:-not given}"
+echo "Engine:       ${ENGINE:-not given, inferred from the pods}"
 echo "Results dir:  ${RESULTS_DIR}"
 
 echo "=== Checking pod-snapshot alerting thresholds ==="
@@ -60,4 +66,5 @@ echo "=== Checking pod-snapshot alerting thresholds ==="
 exec python3 "${SCRIPTS_DIR}/check_thresholds.py" \
   --namespace "${NAMESPACE}" \
   --selector "${SELECTOR}" \
-  --csv "${RESULTS_DIR}/results.csv"
+  --csv "${RESULTS_DIR}/results.csv" \
+  ${ENGINE:+--engine "${ENGINE}"}
