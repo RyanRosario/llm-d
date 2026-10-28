@@ -126,6 +126,12 @@ jobs:
       # cut at a '-', which makes the label invalid and silently disables snapshots.
       namespace: llm-d-nightly-pod-snapshot-vllm
       gateway_host: 'pod-snapshot-epp'
+      # Both pod-snapshot lanes share the 2-GPU cluster and GCS bucket across two
+      # namespaces; tear down any leftover sibling namespace (e.g. after skip_cleanup)
+      # and its PodSnapshot CRs before nightly-deploy-gke.sh wipes the bucket.
+      pre_deploy_script: |
+        kubectl delete podsnapshots --all -n llm-d-nightly-pod-snapshot-sglang --ignore-not-found --timeout=60s 2>/dev/null || true
+        kubectl delete namespace llm-d-nightly-pod-snapshot-sglang --ignore-not-found --timeout=120s 2>/dev/null || true
       custom_deploy_script: |
         MODEL_SERVER=vllm \
           bash guides/pod-snapshot/scripts/nightly-deploy-gke.sh
@@ -143,6 +149,10 @@ jobs:
       # this is a brief grace for the EPP to finish backend discovery before
       # the smoke loop fires (reusable default is 180s).
       pod_readiness_delay: 60
+      # Check GPU availability runs before Clean up previous nightly resources in the
+      # reusable workflow; allow_gpu_preemption lets the check pass when a prior run
+      # used skip_cleanup=true so cleanup and pre_deploy_script can free the 2 GPUs.
+      allow_gpu_preemption: true
       llm_d_ref: ${{ github.ref }}
       skip_cleanup: ${{ github.event.inputs.skip_cleanup == 'true' || github.event.inputs.cleanup == 'false' }}
       pr_number: ${{ github.event.inputs.pr_number }}

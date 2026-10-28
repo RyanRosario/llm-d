@@ -56,7 +56,6 @@ VLLM_COLD = [
     (180, "torch.compile takes 13.0 s in total"),
     (200, "Graph capturing finished in 19 secs, took 1.07 GiB"),
     (205, "init engine (profile, create kv cache, warmup model) took 45.00 seconds"),
-    (206, "Application startup complete."),
     (207, "Executing engine.sleep(level=1) to release physical VRAM"),
     (215, "It took 8.00 seconds to fall asleep"),
     (216, "Triggering snapshot checkpoint"),
@@ -64,7 +63,7 @@ VLLM_COLD = [
     (251, "Snapshot checkpoint created successfully"),
     (252, "Executing engine.wake_up() to restore VRAM"),
     (260, "It took 8.00 seconds to wake up"),
-    (261, "Restored server_status to Up (wake-to-ready=0.50s)"),
+    (261, "Application startup complete."),
 ]
 VLLM_RESTORE = [  # offsets relative to Pod 2's creation
     (10, "gVisor checkpoint completed successfully (barrier unblocked in 34.00s)"),
@@ -255,6 +254,49 @@ def test_engine_hint_is_kept_when_the_log_does_not_identify_the_engine():
     assert st.log_values(log(VLLM_COLD), engine="sglang")["engine"] == "vllm"
 
 
+def test_main_branch_sglang_wrapper_lines_parse_cold_and_restore():
+    # Covers docker/scripts/snapshot/sglang/wrapper.py on main: uvicorn logs
+    # "Application startup complete." before warmup/snapshot, HTTP 200 lines mark
+    # release/resume, CHECKPOINT_OK_RE marks checkpoint/restore, and
+    # STATUS_RESTORED_RE marks the final post-wake "up" timestamp.
+    sglang_main_cold = [
+        (60, "Hooking SGLang HTTP server startup..."),
+        (90, "Load weight begin. avail mem=78.50 GB"),
+        (170, "Load weight end. elapsed=80.00 s"),
+        (200, "Capture cuda graph end. Time elapsed: 24.00 s"),
+        (202, "Application startup complete."),
+        (206, "Holding server_status at Starting until the snapshot completes."),
+        (211, "Executing POST /release_memory_occupation to release physical VRAM..."),
+        (219, 'INFO:     127.0.0.1:41234 - "POST /release_memory_occupation HTTP/1.1" 200 OK'),
+        (220, "Triggering snapshot checkpoint..."),
+        (255, "Snapshot checkpoint created successfully."),
+        (257, "Executing POST /resume_memory_occupation to restore VRAM..."),
+        (266, 'INFO:     127.0.0.1:41236 - "POST /resume_memory_occupation HTTP/1.1" 200 OK'),
+        (267, "SGLang memory occupation resumed successfully."),
+        (268, "Restored server_status to ServerStatus.Up."),
+    ]
+    vc = st.log_values(log(sglang_main_cold))
+    assert vc["engine"] == "sglang"
+    assert "restored" not in vc
+    assert vc["released_ts"] == at(219)
+    assert vc["checkpoint_ts"] == at(255)
+    assert vc["resumed_ts"] == at(266)
+    assert vc["up_ts"] == at(268)
+
+    sglang_main_restore = [
+        (10, "Snapshot checkpoint created successfully."),
+        (11, "Executing POST /resume_memory_occupation to restore VRAM..."),
+        (16, "SGLang memory occupation resumed successfully."),
+        (16.5, "Restored server_status to ServerStatus.Up."),
+    ]
+    vr = st.log_values(log(sglang_main_restore))
+    assert vr["engine"] == "sglang"
+    assert vr["restored"] is True
+    assert vr["restore_ts"] == at(10)
+    assert vr["resumed_ts"] == at(16)
+    assert vr["up_ts"] == at(16.5)
+
+
 # --- Metrics -----------------------------------------------------------------------------------
 
 
@@ -395,6 +437,17 @@ def test_pod_2_that_cold_started_instead_of_restoring_fails():
     assert failed == ["Application Cold Start on Pod 2 (Row 2)"]
     assert "152.00s <= 0s" in next(c.detail for c in checks if not c.passed)
     # No restore metrics, so no speedup check at all rather than a misleading pass.
+    assert "Restore speedup ECS / WSR (WSR = 1b+1c+4e+4f+3)" not in [c.name for c in checks]
+
+
+def test_pod_2_unrestored_with_empty_logs_fails_instead_of_false_passing():
+    p1, _ = good_pods()
+    p2 = metrics_pod(created=1000, scheduled=1001, sandbox=1004, pulled=1005, started=1006, ready=1020,
+                     restored=None, log={})
+    checks = ct.evaluate(p1, p2, "vllm")
+    failed = names_of(checks, False)
+    assert failed == ["Application Cold Start on Pod 2 (Row 2)"]
+    assert "Pod 2 did not restore" in next(c.detail for c in checks if not c.passed)
     assert "Restore speedup ECS / WSR (WSR = 1b+1c+4e+4f+3)" not in [c.name for c in checks]
 
 

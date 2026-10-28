@@ -390,12 +390,19 @@ def log_values(log_text, engine=""):
         elif UP_RE.search(text):
             values["up_ts"] = ts
         elif STATUS_RESTORED_RE.search(text):
-            values.setdefault("up_ts", ts)
+            # "Restored server_status to ServerStatus.Up." is the last line of the SGLang
+            # wrapper's sleep/snapshot/wake cycle (docker/scripts/snapshot/sglang/wrapper.py),
+            # so it always wins over an earlier "up" candidate.
+            values["up_ts"] = ts
         elif VLLM_APP_UP_RE.search(text):
-            values["engine"] = "vllm"
+            # uvicorn logs this for both engines, so it must not set the engine. vLLM takes
+            # the snapshot inside its patched lifespan, so the line follows the wake; SGLang
+            # logs it when the HTTP server starts, before the warmup hook and the snapshot.
+            # It therefore only counts as "up" once a snapshot or restore marker was seen.
             if "resumed_ts" not in values and "wake_req_ts" in values:
                 values["resumed_ts"] = ts
-            values.setdefault("up_ts", ts)
+            if any(k in values for k in ("checkpoint_ts", "restore_ts", "resumed_ts", "trigger_ts")):
+                values.setdefault("up_ts", ts)
     return values
 
 

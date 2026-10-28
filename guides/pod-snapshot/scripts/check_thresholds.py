@@ -93,9 +93,16 @@ def evaluate(p1, p2, engine: str) -> list[v.Check]:
                               f"{speedup:.2f}x >= {t['min_restore_speedup']:.0f}x (WSR {wsr:.2f}s)"))
 
     if p2_ok:
-        acs2 = 0.0 if dp.is_restored(p2) else dp.compute_cold_metrics(p2)["2"]
-        checks.append(v.Check("Application Cold Start on Pod 2 (Row 2)", acs2 <= MAX_POD2_APP_COLD_START_S,
-                              f"{acs2:.2f}s <= {MAX_POD2_APP_COLD_START_S:.0f}s"))
+        restored = dp.is_restored(p2)
+        acs2 = 0.0 if restored else dp.compute_cold_metrics(p2)["2"]
+        detail = (
+            f"{acs2:.2f}s <= {MAX_POD2_APP_COLD_START_S:.0f}s"
+            if restored or acs2 > 0
+            else f"{acs2:.2f}s <= {MAX_POD2_APP_COLD_START_S:.0f}s (Pod 2 did not restore)"
+        )
+        checks.append(v.Check("Application Cold Start on Pod 2 (Row 2)",
+                              restored and acs2 <= MAX_POD2_APP_COLD_START_S,
+                              detail))
     return checks
 
 
