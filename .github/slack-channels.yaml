@@ -47,7 +47,6 @@ channels:
     - nightly-e2e-optimized-baseline-cks-acc-gpu-vllm-x.yaml
     - nightly-e2e-optimized-baseline-gke-acc-gpu-sglang-x.yaml
     - nightly-e2e-optimized-baseline-gke-acc-gpu-vllm-x.yaml
-    - nightly-e2e-optimized-baseline-gke-acc-tpu-sglang-x.yaml
     - nightly-e2e-optimized-baseline-gke-acc-tpu-vllm-x.yaml
     - nightly-e2e-optimized-baseline-ibm-acc-gpu-vllm-x.yaml
     - nightly-e2e-optimized-baseline-intel-acc-xpu-vllm-x.yaml
@@ -59,6 +58,8 @@ channels:
     - nightly-e2e-pd-disaggregation-gke-acc-tpu-vllm-x.yaml
     - nightly-e2e-pd-disaggregation-ibm-acc-gpu-vllm-x.yaml
     - nightly-e2e-pd-disaggregation-intel-acc-xpu-vllm-x.yaml
+    - nightly-e2e-pod-snapshot-gke-acc-gpu-sglang-x.yaml
+    - nightly-e2e-pod-snapshot-gke-acc-gpu-vllm-x.yaml
     - nightly-e2e-precise-prefix-cache-routing-amd-ci-acc-rocm-vllm-x.yaml
     - nightly-e2e-precise-prefix-cache-routing-cks-acc-gpu-vllm-x.yaml
     - nightly-e2e-precise-prefix-cache-routing-gke-acc-gpu-vllm-x.yaml
