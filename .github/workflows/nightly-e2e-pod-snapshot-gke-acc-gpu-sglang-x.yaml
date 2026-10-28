@@ -117,8 +117,7 @@ concurrency:
 
 jobs:
   nightly:
-    if: github.repository == 'llm-d/llm-d'
-    uses: llm-d/llm-d-infra/.github/workflows/reusable-nightly-e2e-gke.yaml@main
+    uses: ./.github/workflows/reusable-nightly-e2e-gke.yaml
     with:
       guide_name: pod-snapshot
       # Kept short: the cluster-scoped PodSnapshotStorageConfig is named
@@ -153,7 +152,7 @@ jobs:
       # reusable workflow; allow_gpu_preemption lets the check pass when a prior run
       # used skip_cleanup=true so cleanup and pre_deploy_script can free the 2 GPUs.
       allow_gpu_preemption: true
-      llm_d_ref: ${{ github.ref }}
+      llm_d_ref: refs/pull/2925/head
       skip_cleanup: ${{ github.event.inputs.skip_cleanup == 'true' || github.event.inputs.cleanup == 'false' }}
       pr_number: ${{ github.event.inputs.pr_number }}
       pr_repo: ${{ github.event.inputs.pr_repo }}
