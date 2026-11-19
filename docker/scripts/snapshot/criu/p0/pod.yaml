@@ -1,0 +1,64 @@
+# P0 feasibility pod: one privileged vLLM+CRIU container on a plain (non-gVisor) GPU node.
+# Drive it with: kubectl exec -n criu-p0 criu-p0 -- criu-snapshot.sh <cmd>
+#
+# Fill in IMAGE before applying (see README.md). Intentionally not a Deployment: the whole
+# point of P0 is that dump and restore happen inside this one pod.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: criu-p0
+  labels:
+    app: criu-p0
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    cloud.google.com/gke-nodepool: a100-pool
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+    - key: cloud.google.com/gke-spot
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  containers:
+    - name: vllm
+      image: IMAGE
+      imagePullPolicy: Always
+      # PID 1 must reap zombies: after `kill`, un-reaped children of the old vLLM tree would
+      # still own the PIDs that `criu restore` needs. A bash `wait` loop reaps; `sleep infinity`
+      # as PID 1 does not.
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          trap 'exit 0' TERM INT
+          while true; do sleep 3600 & wait $!; done
+      securityContext:
+        privileged: true
+      env:
+        - name: HF_HOME
+          value: /root/.cache/huggingface
+        - name: HF_HUB_ENABLE_HF_TRANSFER
+          value: "1"
+      resources:
+        requests:
+          cpu: "8"
+          memory: 48Gi
+          nvidia.com/gpu: 1
+        limits:
+          cpu: "12"
+          memory: 96Gi
+          nvidia.com/gpu: 1
+      volumeMounts:
+        - mountPath: /dev/shm
+          name: shm
+        - mountPath: /checkpoints
+          name: checkpoints
+  volumes:
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Gi
+    - name: checkpoints
+      emptyDir:
+        sizeLimit: 80Gi
