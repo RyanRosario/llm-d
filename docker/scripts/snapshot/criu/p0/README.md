@@ -15,6 +15,8 @@ GCS transfer (the numbers comparable to the gVisor benchmark) are P1.
 
 ## Result (2026-11-19): feasible
 
+**This experiment proved feasibility, but the measures here are not yet aligned with the gVisor implementation.**
+
 `Qwen/Qwen3-8B`, vLLM `v0.30.0`, 1× A100-SXM4-40GB (`a2-highgpu-2g`, Spot), GKE `fma-e2e` runc node:
 COS kernel `6.12.110+`, containerd `2.2.7`, driver `580.178.04`, CRIU `4.3.1`. Same pod, `emptyDir` images.
 Restored server returns the same completion as the original.
