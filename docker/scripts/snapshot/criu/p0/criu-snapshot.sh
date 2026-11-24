@@ -18,7 +18,8 @@
 # Knobs: MODEL (Qwen/Qwen3-8B), PORT (8000), IMG_DIR (/checkpoints/images), TIMINGS
 #        (/checkpoints/timings.csv), MODEL_CACHE_DIR (unset = no purge), SAVE_AUX (0; tar
 #        /dev/shm and /tmp next to the images, needed once restore happens in another pod),
-#        VLLM_EXTRA_ARGS, CRIU_EXTRA_ARGS, MAX_MODEL_LEN (8192), GPU_MEM_UTIL (0.90).
+#        VLLM_EXTRA_ARGS, CRIU_EXTRA_ARGS, CRIU_RESTORE_ARGS, CRIU_VERBOSITY (4), MAX_MODEL_LEN (8192),
+#        GPU_MEM_UTIL (0.90).
 #
 # The echo'd marker lines deliberately match docker/scripts/snapshot/vllm/wrapper.py so
 # guides/pod-snapshot/scripts/snapshot_timings.py (branch pod-snapshot-cicd) can parse a
@@ -37,6 +38,7 @@ VLLM_LOG="${VLLM_LOG:-/checkpoints/vllm.log}"
 PIDFILE="${PIDFILE:-/checkpoints/vllm.pid}"
 BASE="http://127.0.0.1:${PORT}"
 ACTION_SCRIPT="${ACTION_SCRIPT:-/usr/local/bin/criu-action.sh}"
+CRIU_VERBOSITY="${CRIU_VERBOSITY:-4}"  # -v4 writes ~8 MB per dump/restore log; use 1 for timing runs
 
 now() { date +%s.%N; }
 ts() { date -u +%FT%T.%3NZ; }
@@ -132,7 +134,7 @@ cmd_dump() {
     --leave-running --tcp-close --file-locks --link-remap \
     --manage-cgroups=ignore --timeout 120 \
     --action-script "${ACTION_SCRIPT}" \
-    --log-file dump.log -v4 ${CRIU_EXTRA_ARGS:-} \
+    --log-file dump.log -v"${CRIU_VERBOSITY}" ${CRIU_EXTRA_ARGS:-} \
     || { echo "ERROR: criu dump failed; tail of ${IMG_DIR}/dump.log:" >&2; tail -40 "${IMG_DIR}/dump.log" >&2; exit 1; }
   phase criu_dump "${t1}" "$(now)"
   echo "Snapshot checkpoint created successfully."
@@ -168,7 +170,7 @@ cmd_restore() {
   # shellcheck disable=SC2086
   criu restore --images-dir "${IMG_DIR}" --restore-detached \
     --tcp-close --file-locks --link-remap --manage-cgroups=ignore \
-    --pidfile "${PIDFILE}" --log-file restore.log -v4 ${CRIU_EXTRA_ARGS:-} \
+    --pidfile "${PIDFILE}" --log-file restore.log -v"${CRIU_VERBOSITY}" ${CRIU_EXTRA_ARGS:-} ${CRIU_RESTORE_ARGS:-} \
     || { echo "ERROR: criu restore failed; tail of ${IMG_DIR}/restore.log:" >&2; tail -40 "${IMG_DIR}/restore.log" >&2; exit 1; }
   phase criu_restore "${t0}" "$(now)"
   echo "Process restored from snapshot checkpoint. Resuming engine..."
@@ -208,5 +210,6 @@ cmd_cycle() {
 
 case "${1:-}" in
   check|cold|dump|kill|restore|wake|verify|status|cycle) "cmd_$1" ;;
+  _tree_pids) tree_pids ;;  # used by the P1 entrypoint
   *) sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

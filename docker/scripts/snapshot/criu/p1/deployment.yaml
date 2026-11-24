@@ -1,0 +1,104 @@
+# P1: two-pod CRIU snapshot experiment. Apply with replicas=1; once pod 1 logs
+# "Snapshot upload complete.", scale to 2 and pod 2 restores from GCS on the other node.
+#
+#   sed "s#IMAGE#${IMAGE}#; s#BUCKET#${GCS_BUCKET}#" deployment.yaml | kubectl apply -n criu-p1 -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: criu-runner
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: criu-p1
+  labels:
+    app: criu-p1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: criu-p1
+  template:
+    metadata:
+      labels:
+        app: criu-p1
+    spec:
+      serviceAccountName: criu-runner
+      nodeSelector:
+        cloud.google.com/gke-nodepool: a100-pool
+      # One pod per node, like the gVisor benchmark (pod 2 restores on a second node).
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: criu-p1
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: cloud.google.com/gke-spot
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: vllm
+          image: IMAGE
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          env:
+            - name: SNAPSHOT_BUCKET
+              value: BUCKET
+            - name: MODEL
+              value: Qwen/Qwen3-8B
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: CRIU_VERBOSITY
+              value: "1"
+            - name: HF_HOME
+              value: /root/.cache/huggingface
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+          ports:
+            - containerPort: 8000
+              name: http
+          resources:
+            requests:
+              cpu: "8"
+              memory: 48Gi
+              nvidia.com/gpu: 1
+            limits:
+              cpu: "12"
+              memory: 96Gi
+              nvidia.com/gpu: 1
+          # Pod 1: download + cold start + sleep + dump + wake before /health answers (~10 min).
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 900
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 3
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /checkpoints
+              name: checkpoints
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: checkpoints
+          emptyDir:
+            sizeLimit: 80Gi
